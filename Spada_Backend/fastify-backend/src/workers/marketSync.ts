@@ -1,5 +1,14 @@
 import 'dotenv/config';
 import { supabaseAdmin } from '../lib/supabase.js';
+import { kalshiGetMarketsPaginated } from '../lib/kalshiClient.js';
+
+/** Kalshi page size — API allows up to 1000; keep modest to avoid heavy payloads. */
+const KALSHI_PAGE_LIMIT = 200;
+/** Safety cap per sync cycle (200 × 25 = 5,000 markets). Cursor advances across cycles. */
+const KALSHI_MAX_PAGES_PER_CYCLE = 25;
+
+/** In-process cursor so hourly sync walks the full open catalog over time. */
+let kalshiMarketsCursor: string | null = null;
 
 interface StandardizedMarket {
   canonical_id: string;
@@ -71,9 +80,9 @@ function classifyCategory(title: string): string {
 async function fetchPolymarket(): Promise<StandardizedMarket[]> {
   const results: StandardizedMarket[] = [];
 
-  // A. Fetch high-volume binary markets
+  // A. Fetch high-volume binary markets (Gamma keyset pagination — official + POC)
   try {
-    const url = 'https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=70&order=volume24hr&ascending=false';
+    const url = 'https://gamma-api.polymarket.com/markets/keyset?active=true&closed=false&limit=70&order=volume24hr&ascending=false';
     const res = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -82,7 +91,8 @@ async function fetchPolymarket(): Promise<StandardizedMarket[]> {
     });
 
     if (res.ok) {
-      const markets = await res.json();
+      const body = await res.json();
+      const markets = Array.isArray(body) ? body : (body?.markets ?? []);
       if (Array.isArray(markets)) {
         for (const m of markets) {
           const extId = String(m.conditionId || m.id || m.slug || '').trim();
@@ -105,13 +115,15 @@ async function fetchPolymarket(): Promise<StandardizedMarket[]> {
             volume: parseFloat(m.volume24hr || m.volume || 0),
             active: m.active ?? true,
             raw_data: {
-              ...m,
+              // Gamma numeric market id — keys public.polymarket_orderbook.market_id
+              id: m.id != null ? m.id : null,
               clobTokenIds,
               slug,
               market_url: `https://polymarket.com/market/${slug}`,
               description: m.description || null,
               resolution_source: m.resolutionSource || m.resolution_source || null,
               end_date: m.endDate || m.end_date || m.endDateIso || null,
+              conditionId: m.conditionId || null,
             },
             updated_at: new Date().toISOString(),
           });
@@ -122,9 +134,9 @@ async function fetchPolymarket(): Promise<StandardizedMarket[]> {
     console.error('[Sync Worker] Polymarket binary fetch error:', err.message);
   }
 
-  // B. Fetch multi-outcome events (3, 4, 5+ choices)
+  // B. Fetch multi-outcome events (Gamma /events/keyset — official + POC)
   try {
-    const eventsUrl = 'https://gamma-api.polymarket.com/events?active=true&closed=false&limit=30&order=volume24hr&ascending=false';
+    const eventsUrl = 'https://gamma-api.polymarket.com/events/keyset?active=true&closed=false&limit=30&order=volume24hr&ascending=false';
     const res = await fetch(eventsUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -133,7 +145,8 @@ async function fetchPolymarket(): Promise<StandardizedMarket[]> {
     });
 
     if (res.ok) {
-      const events = await res.json();
+      const body = await res.json();
+      const events = Array.isArray(body) ? body : (body?.events ?? []);
       if (Array.isArray(events)) {
         for (const e of events) {
           if (!Array.isArray(e.markets) || e.markets.length <= 2) continue;
@@ -166,7 +179,6 @@ async function fetchPolymarket(): Promise<StandardizedMarket[]> {
             volume: parseFloat(e.volume24hr || e.volume || 0),
             active: e.active ?? true,
             raw_data: {
-              ...e,
               clobTokenIds,
               slug: e.slug || extId,
               market_url: `https://polymarket.com/event/${e.slug || extId}`,
@@ -185,98 +197,267 @@ async function fetchPolymarket(): Promise<StandardizedMarket[]> {
   return results;
 }
 
-// 2. Fetch Kalshi (With browser User-Agent & election host fallback)
-async function fetchKalshi(): Promise<StandardizedMarket[]> {
-  const hosts = [
-    'https://external-api.kalshi.com/trade-api/v2',
-    'https://api.elections.kalshi.com/trade-api/v2',
-  ];
+function parseKalshiMarketVolume(m: any): number {
+  const volume = parseFloat(
+    String(m.volume_24h_fp ?? m.volume_24h ?? m.volume_fp ?? m.volume ?? 0)
+  );
+  return Number.isFinite(volume) ? volume : 0;
+}
 
-  for (const host of hosts) {
-    try {
-      const url = `${host}/markets?limit=100&status=open`;
-      const res = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-          'Accept': 'application/json',
-        },
-      });
+function mapKalshiMarket(m: any): StandardizedMarket | null {
+  const extId = String(m.ticker || m.ticker_name || m.id || '').trim();
+  if (!extId) return null;
 
-      if (!res.ok) {
-        console.warn(`[Sync Worker] Kalshi host ${host} returned status: ${res.status}`);
+  // Prefer dollar fields (0–1). Legacy cent fields need /100.
+  let yesPrice = 0;
+  if (typeof m.last_price_dollars === 'number' || typeof m.last_price_dollars === 'string') {
+    yesPrice = parseFloat(String(m.last_price_dollars));
+  } else if (typeof m.yes_bid_dollars === 'number' || typeof m.yes_ask_dollars === 'number') {
+    const bid = parseFloat(String(m.yes_bid_dollars ?? NaN));
+    const ask = parseFloat(String(m.yes_ask_dollars ?? NaN));
+    if (Number.isFinite(bid) && Number.isFinite(ask)) yesPrice = (bid + ask) / 2;
+    else if (Number.isFinite(bid)) yesPrice = bid;
+    else if (Number.isFinite(ask)) yesPrice = ask;
+  } else if (typeof m.last_price === 'number' && m.last_price > 0) {
+    yesPrice = m.last_price > 1 ? m.last_price / 100 : m.last_price;
+  } else if (typeof m.yes_bid === 'number' && typeof m.yes_ask === 'number' && (m.yes_bid > 0 || m.yes_ask > 0)) {
+    yesPrice = (m.yes_bid + m.yes_ask) / 2 / 100;
+  }
+
+  if (!Number.isFinite(yesPrice) || yesPrice < 0) yesPrice = 0;
+  if (yesPrice > 1) yesPrice = yesPrice / 100;
+
+  const title = m.title || m.ticker || 'Untitled Market';
+  const resolvedCategory =
+    m.category && m.category !== 'General' && !m.category.includes('CROSSCATEGORY')
+      ? m.category
+      : classifyCategory(title);
+
+  const ticker = m.ticker || extId;
+  const volume = parseKalshiMarketVolume(m);
+  const eventTicker =
+    typeof m.event_ticker === 'string' && m.event_ticker.trim()
+      ? m.event_ticker.trim()
+      : null;
+
+  return {
+    canonical_id: `kalshi_${extId}`,
+    platform: 'kalshi',
+    external_id: extId,
+    title,
+    category: resolvedCategory,
+    outcomes: ['YES', 'NO'],
+    prices: [yesPrice, parseFloat((1 - yesPrice).toFixed(4))],
+    volume,
+    active: m.status === 'open' || m.status === 'active',
+    raw_data: {
+      ticker,
+      event_ticker: eventTicker,
+      series_ticker: m.series_ticker || null,
+      market_url: `https://kalshi.com/markets/${eventTicker || ticker}`,
+      rules_primary: m.rules_primary || null,
+      rules_secondary: m.rules_secondary || null,
+      close_time: m.close_time || m.expiration_time || null,
+      // Outcome / side labels — required for cross-platform matchText (divergence).
+      yes_sub_title: typeof m.yes_sub_title === 'string' ? m.yes_sub_title : null,
+      no_sub_title: typeof m.no_sub_title === 'string' ? m.no_sub_title : null,
+      subtitle: typeof m.subtitle === 'string' ? m.subtitle : null,
+    },
+    updated_at: new Date().toISOString(),
+  };
+}
+
+/**
+ * Kalshi has no event-level volume field — only per-market volume_24h_fp / volume_24h.
+ * Event volume = sum of independent market volumes sharing the same event_ticker.
+ * Batch totals are merged with sibling markets already in DB (pagination-safe).
+ */
+async function attachKalshiEventVolumes(
+  markets: StandardizedMarket[]
+): Promise<StandardizedMarket[]> {
+  if (markets.length === 0) return markets;
+
+  const batchIdsByEvent = new Map<string, Set<string>>();
+  const batchTotals = new Map<string, number>();
+
+  for (const m of markets) {
+    const et = m.raw_data?.event_ticker;
+    if (typeof et !== 'string' || !et) continue;
+    if (!batchIdsByEvent.has(et)) batchIdsByEvent.set(et, new Set());
+    batchIdsByEvent.get(et)!.add(m.canonical_id);
+    batchTotals.set(et, (batchTotals.get(et) ?? 0) + (Number.isFinite(m.volume) ? m.volume : 0));
+  }
+
+  const eventTotals = new Map(batchTotals);
+  const eventTickers = [...batchTotals.keys()];
+
+  try {
+    for (const tickerChunk of chunkArray(eventTickers, 30)) {
+      const { data, error } = await supabaseAdmin
+        .from('markets')
+        .select('canonical_id, volume, raw_data')
+        .eq('platform', 'kalshi')
+        .eq('active', true)
+        .filter('raw_data->>event_ticker', 'in', `(${tickerChunk.join(',')})`);
+
+      if (error) {
+        console.warn(
+          '[Sync Worker] Kalshi event volume DB merge warning:',
+          formatSupabaseError(error)
+        );
         continue;
       }
 
-      const data = await res.json();
-      const markets = data.markets || [];
-
-      if (markets.length === 0) continue;
-
-      return markets
-        .map((m: any): StandardizedMarket | null => {
-          const extId = String(m.ticker || m.ticker_name || m.id || '').trim();
-          if (!extId) return null;
-
-          let yesPrice = 0;
-          if (typeof m.last_price_dollars === 'number' || typeof m.last_price_dollars === 'string') {
-            yesPrice = parseFloat(String(m.last_price_dollars));
-          } else if (typeof m.last_price === 'number' && m.last_price > 0) {
-            yesPrice = m.last_price / 100;
-          } else if (typeof m.yes_bid === 'number' && typeof m.yes_ask === 'number' && (m.yes_bid > 0 || m.yes_ask > 0)) {
-            yesPrice = (m.yes_bid + m.yes_ask) / 2 / 100;
-          }
-
-          const title = m.title || m.ticker || 'Untitled Market';
-          const resolvedCategory =
-            m.category && m.category !== 'General' && !m.category.includes('CROSSCATEGORY')
-              ? m.category
-              : classifyCategory(title);
-
-          const ticker = m.ticker || extId;
-
-          return {
-            canonical_id: `kalshi_${extId}`,
-            platform: 'kalshi',
-            external_id: extId,
-            title,
-            category: resolvedCategory,
-            outcomes: ['YES', 'NO'],
-            prices: [yesPrice, parseFloat((1 - yesPrice).toFixed(4))],
-            volume: parseFloat(m.volume_24h || m.volume || 0),
-            active: m.status === 'open' || m.status === 'active',
-            raw_data: {
-              ...m,
-              ticker,
-              market_url: `https://kalshi.com/markets/${m.event_ticker || ticker}`,
-              rules_primary: m.rules_primary || null,
-              rules_secondary: m.rules_secondary || null,
-              settlement_sources: m.settlement_sources || null,
-              close_time: m.close_time || m.expiration_time || null,
-            },
-            updated_at: new Date().toISOString(),
-          };
-        })
-        .filter((item: StandardizedMarket | null): item is StandardizedMarket => item !== null);
-    } catch (err: any) {
-      console.warn(`[Sync Worker] Kalshi request failed on ${host}:`, err.message);
+      for (const row of data ?? []) {
+        const et = row.raw_data?.event_ticker;
+        if (typeof et !== 'string' || !et) continue;
+        if (batchIdsByEvent.get(et)?.has(row.canonical_id)) continue;
+        const siblingVol = Number(row.volume || 0);
+        if (!Number.isFinite(siblingVol) || siblingVol <= 0) continue;
+        eventTotals.set(et, (eventTotals.get(et) ?? 0) + siblingVol);
+      }
     }
+  } catch (err: any) {
+    console.warn(
+      '[Sync Worker] Kalshi event volume DB merge failed (using batch sums):',
+      err?.message ?? err
+    );
   }
 
-  return [];
+  return markets.map((m) => {
+    const et = m.raw_data?.event_ticker;
+    const marketVol = Number.isFinite(m.volume) ? m.volume : 0;
+    const eventVolume =
+      typeof et === 'string' && et ? (eventTotals.get(et) ?? marketVol) : marketVol;
+
+    return {
+      ...m,
+      raw_data: {
+        ...m.raw_data,
+        event_volume: eventVolume,
+      },
+    };
+  });
+}
+
+/**
+ * Fetch Kalshi open markets via cursor pagination (not a single limit=100 page).
+ * Uses mve_filter=exclude so combinatorial MVE markets don't crowd out tradable markets.
+ * Advances an in-process cursor each cycle so the full catalog is covered over time.
+ */
+async function fetchKalshi(): Promise<StandardizedMarket[]> {
+  try {
+    const { markets, nextCursor, pagesFetched } = await kalshiGetMarketsPaginated({
+      status: 'open',
+      limit: KALSHI_PAGE_LIMIT,
+      maxPages: KALSHI_MAX_PAGES_PER_CYCLE,
+      mve_filter: 'exclude',
+      cursor: kalshiMarketsCursor,
+    });
+
+    kalshiMarketsCursor = nextCursor;
+    if (!nextCursor) {
+      console.log(
+        `[Sync Worker] Kalshi catalog pass complete (pages=${pagesFetched}, markets=${markets.length}). Cursor reset.`
+      );
+    } else {
+      console.log(
+        `[Sync Worker] Kalshi page batch pages=${pagesFetched} markets=${markets.length} cursor_pending=true`
+      );
+    }
+
+    if (markets.length === 0) return [];
+
+    // Dedupe by ticker within the batch (upsert on canonical_id also prevents DB duplicates)
+    const byTicker = new Map<string, StandardizedMarket>();
+    for (const m of markets) {
+      const mapped = mapKalshiMarket(m);
+      if (!mapped) continue;
+      byTicker.set(mapped.external_id, mapped);
+    }
+
+    // Attach event-level volume (sum of market volumes sharing event_ticker)
+    return attachKalshiEventVolumes([...byTicker.values()]);
+  } catch (err: any) {
+    console.warn('[Sync Worker] Kalshi authenticated request failed:', err.message);
+    return [];
+  }
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+function formatSupabaseError(error: any): string {
+  const raw = String(error?.message ?? error ?? 'unknown');
+  if (raw.includes('<!DOCTYPE html') || raw.includes('Error code 520')) {
+    return 'Supabase host temporarily unavailable (Cloudflare 520). Will retry next cycle.';
+  }
+  if (raw.includes('Error code 5')) {
+    return `Supabase upstream error: ${raw.slice(0, 120)}`;
+  }
+  return raw.slice(0, 300);
+}
+
+async function sleep(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function upsertMarketsBatch(rows: StandardizedMarket[], attempt = 1): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from('markets')
+    .upsert(rows, { onConflict: 'canonical_id' });
+
+  if (!error) return;
+
+  const message = formatSupabaseError(error);
+  const transient =
+    message.includes('520') ||
+    message.includes('temporarily unavailable') ||
+    message.includes('upstream error') ||
+    /5\d\d/.test(String(error?.code ?? ''));
+
+  if (transient && attempt < 3) {
+    const delay = attempt * 1500;
+    console.warn(`[Sync Worker] upsert batch retry ${attempt}/3 after ${delay}ms: ${message}`);
+    await sleep(delay);
+    return upsertMarketsBatch(rows, attempt + 1);
+  }
+
+  throw new Error(message);
 }
 
 // 3. Upsert into Supabase (Preserves existing AI summaries)
 async function saveMarkets(markets: StandardizedMarket[]) {
   if (markets.length === 0) return;
 
-  // Retrieve existing AI summaries so upsert does not reset them to null
-  const ids = markets.map((m) => m.canonical_id);
-  const { data: existing } = await supabaseAdmin
-    .from('markets')
-    .select('canonical_id, ai_summary, ai_sentiment_label, ai_last_updated')
-    .in('canonical_id', ids);
+  const existingMap = new Map<
+    string,
+    { ai_summary: string | null; ai_sentiment_label: string | null; ai_last_updated: string | null }
+  >();
 
-  const existingMap = new Map((existing ?? []).map((e) => [e.canonical_id, e]));
+  // Chunk .in() lookups — large ID lists + fat payloads trigger Cloudflare 520s
+  for (const idChunk of chunkArray(
+    markets.map((m) => m.canonical_id),
+    50
+  )) {
+    const { data: existing, error } = await supabaseAdmin
+      .from('markets')
+      .select('canonical_id, ai_summary, ai_sentiment_label, ai_last_updated')
+      .in('canonical_id', idChunk);
+
+    if (error) {
+      console.warn('[Sync Worker] AI summary lookup warning:', formatSupabaseError(error));
+      continue;
+    }
+    for (const row of existing ?? []) {
+      existingMap.set(row.canonical_id, row);
+    }
+  }
 
   const mergedMarkets = markets.map((m) => {
     const prev = existingMap.get(m.canonical_id);
@@ -288,15 +469,18 @@ async function saveMarkets(markets: StandardizedMarket[]) {
     };
   });
 
-  const { error } = await supabaseAdmin
-    .from('markets')
-    .upsert(mergedMarkets, { onConflict: 'canonical_id' });
-
-  if (error) {
-    console.error('[Sync Worker] Supabase Upsert Error:', error.message);
-  } else {
-    console.log(`[Sync Worker] Successfully synced ${markets.length} markets into Supabase.`);
+  let written = 0;
+  for (const batch of chunkArray(mergedMarkets, 25)) {
+    try {
+      await upsertMarketsBatch(batch);
+      written += batch.length;
+    } catch (err: any) {
+      console.error('[Sync Worker] Supabase Upsert Error:', formatSupabaseError(err));
+    }
+    await sleep(100);
   }
+
+  console.log(`[Sync Worker] Successfully synced ${written}/${markets.length} markets into Supabase.`);
 }
 
 export async function runMarketSync() {

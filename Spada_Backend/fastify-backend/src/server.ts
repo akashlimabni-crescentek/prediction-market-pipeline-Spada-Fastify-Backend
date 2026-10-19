@@ -20,6 +20,8 @@ import { startPriceStreamWorker } from './workers/priceStream.js';
 import { runMarketSync } from './workers/marketSync.js';
 import { runNewsSyncWorker } from './workers/newsSync.js';
 import { runAISummaryWorker } from './workers/aiSummaryWorker.js';
+import { runCandleSyncWorker } from './workers/candleSync.js';
+import { runMarketMatchSyncWorker } from './workers/marketMatchSync.js';
 
 const server = Fastify({
   logger: {
@@ -73,6 +75,30 @@ function scheduleBackgroundWorkers() {
       server.log.error(`[Workers] AI summary interval error: ${err.message}`)
     );
   }, 2 * 60 * 60 * 1000);
+
+  // 5. Historical OHLCV backfill into *_ohlc / *_price_history (boot + every 15m)
+  setTimeout(() => {
+    runCandleSyncWorker().catch((err) =>
+      server.log.error(`[Workers] Candle sync error: ${err.message}`)
+    );
+  }, 20_000);
+  setInterval(() => {
+    runCandleSyncWorker().catch((err) =>
+      server.log.error(`[Workers] Candle sync interval error: ${err.message}`)
+    );
+  }, 15 * 60 * 1000);
+
+  // 6. Cross-platform market matching for ratios (POC Jaccard ≥ 0.88)
+  setTimeout(() => {
+    runMarketMatchSyncWorker().catch((err) =>
+      server.log.error(`[Workers] Market match sync error: ${err.message}`)
+    );
+  }, 45_000);
+  setInterval(() => {
+    runMarketMatchSyncWorker().catch((err) =>
+      server.log.error(`[Workers] Market match sync interval error: ${err.message}`)
+    );
+  }, 60 * 60 * 1000);
 }
 
 async function main() {
@@ -93,7 +119,7 @@ async function main() {
             '### Capabilities',
             '* **Real-Time CLOB Streaming**: Millisecond-level price odds over WebSockets.',
             '* **Direct Exchange Orderbooks**: Live depth retrieved from primary CLOB engines.',
-            '* **Arbitrage Intelligence**: Automated spread calculations and percentage divergence.',
+            '* **Market Intelligence Ratios**: Seven POC ratios (pressure, churn, support, executionCost, divergence, probabilityMomentum, resolutionTension).',
             '* **Claude AI Sentiment**: News aggregation mapped to market titles with sentiment scoring.',
             '',
             '### Authentication',
@@ -158,7 +184,19 @@ async function main() {
             s.description = 'Fetch live orderbook bids and asks directly from the exchange CLOB';
           } else if (url.endsWith('/candles')) {
             s.summary = 'Get Market Candles';
-            s.description = 'Fetch 1-hour OHLCV candle bars for price charting';
+            s.description =
+              'Fetch OHLCV candle bars for price charting. Supports resolutions 5m, 15m, 1h, 4h, 1d, and 1w via the resolution query parameter (default: 1h). Returns newest-first completed bars plus the current forming bucket (composed from finer stored candles and live 1m). History depth is resolution-aware (override with CANDLE_MAX_BARS).';
+            s.querystring = {
+              type: 'object',
+              properties: {
+                resolution: {
+                  type: 'string',
+                  enum: ['5m', '15m', '1h', '4h', '1d', '1w'],
+                  default: '1h',
+                  description: 'Candle interval / chart resolution',
+                },
+              },
+            };
           } else {
             s.summary = 'Get Single Market';
             s.description = 'Fetch full market details and odds by canonical_id';
@@ -185,8 +223,9 @@ async function main() {
         // 3. Ratios
         else if (url.startsWith('/api/v1/ratios')) {
           s.tags = ['Ratios'];
-          s.summary = 'Get Cross-Platform Odds Ratio';
-          s.description = 'Calculates price spread and percentage divergence between Polymarket and Kalshi';
+          s.summary = 'Get Market Intelligence Ratios';
+          s.description =
+            'Returns the seven POC ratios (pressure, churn, support, executionCost, divergence, probabilityMomentum, resolutionTension) plus legacy metrics for compatibility';
         }
 
         // 4. Watchlist

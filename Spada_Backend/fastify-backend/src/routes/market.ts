@@ -1,7 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { supabaseAdmin } from '../lib/supabase.js';
 import { orderbookStore } from '../services/orderbookStore.js';
-import { candleAggregator } from '../services/candleAggregator.js';
+import {
+  candleAggregator,
+  CANDLE_RESOLUTIONS,
+  isCandleResolution,
+  type CandleResolution,
+} from '../services/candleAggregator.js';
 
 function parseArrayField(val: any): any[] {
   if (Array.isArray(val)) return val;
@@ -102,8 +107,18 @@ function formatMarket(m: any) {
   const endingTime = extractEndingTime(m.platform, raw);
   const marketUrl = extractMarketUrl(m.platform, m.external_id, raw);
 
+  // Market volume (unchanged). Event volume: Kalshi stores sum-by-event_ticker in raw_data;
+  // Polymarket binary + polymarket_event_* fall back to markets.volume (event volume for multi rows).
+  const marketVolume = Number(m.volume || 0);
+  const eventVolumeRaw = Number(raw.event_volume);
+  const eventVolume = Number.isFinite(eventVolumeRaw) ? eventVolumeRaw : marketVolume;
+  const eventTicker =
+    typeof raw.event_ticker === 'string' && raw.event_ticker.trim()
+      ? raw.event_ticker.trim()
+      : null;
+
   // Dynamic fallback so the UI never displays an empty AI summary card
-  const fallbackSummary = `Market probability currently stands at ${Math.round(yesPrice * 100)}%. Trading volume is at $${Math.round(m.volume || 0).toLocaleString()}.`;
+  const fallbackSummary = `Market probability currently stands at ${Math.round(yesPrice * 100)}%. Trading volume is at $${Math.round(marketVolume).toLocaleString()}.`;
   const fallbackSentiment = yesPrice > 0.55 ? 'Bullish' : yesPrice < 0.45 ? 'Bearish' : 'Neutral';
 
   return {
@@ -120,7 +135,9 @@ function formatMarket(m: any) {
     yes_price: yesPrice,
     no_price: noPrice,
     implied_probability: yesPrice,
-    volume: Number(m.volume || 0),
+    volume: marketVolume,
+    event_volume: eventVolume,
+    event_ticker: eventTicker,
     is_active: m.active,
     end_date: endingTime,
     close_time: endingTime,
@@ -139,6 +156,80 @@ function resolvePlatformParam(query: Record<string, any>): string | null {
   if (raw.includes('kalsh')) return 'kalshi';
   if (raw.includes('poly')) return 'polymarket';
   return null;
+}
+
+/**
+ * Resolve Kalshi event_volume at read time:
+ * sum of active market volumes sharing raw_data.event_ticker.
+ * Prefer row volumes from `rows` when present (fresher than sibling DB rows).
+ * Polymarket rows are unchanged (formatMarket falls back to markets.volume).
+ */
+async function withKalshiEventVolumes(rows: any[]): Promise<any[]> {
+  if (!rows.length) return rows;
+
+  const eventTickers = new Set<string>();
+  for (const m of rows) {
+    if (m.platform !== 'kalshi') continue;
+    const et = m.raw_data?.event_ticker;
+    if (typeof et === 'string' && et.trim()) eventTickers.add(et.trim());
+  }
+  if (eventTickers.size === 0) return rows;
+
+  const rowById = new Map(rows.map((m) => [m.canonical_id, m]));
+  const totals = new Map<string, number>();
+  const tickers = [...eventTickers];
+
+  for (let i = 0; i < tickers.length; i += 30) {
+    const chunk = tickers.slice(i, i + 30);
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('markets')
+        .select('canonical_id, volume, raw_data')
+        .eq('platform', 'kalshi')
+        .eq('active', true)
+        .filter('raw_data->>event_ticker', 'in', `(${chunk.join(',')})`);
+
+      if (error) {
+        console.warn('[markets] Kalshi event volume lookup:', error.message);
+        continue;
+      }
+
+      for (const row of data ?? []) {
+        const et = row.raw_data?.event_ticker;
+        if (typeof et !== 'string' || !et) continue;
+        const live = rowById.get(row.canonical_id);
+        const vol = Number((live ?? row).volume || 0);
+        if (!Number.isFinite(vol)) continue;
+        totals.set(et, (totals.get(et) ?? 0) + vol);
+      }
+    } catch (err: any) {
+      console.warn('[markets] Kalshi event volume lookup failed:', err?.message ?? err);
+    }
+  }
+
+  return rows.map((m) => {
+    if (m.platform !== 'kalshi') return m;
+    const et = m.raw_data?.event_ticker;
+    const marketVol = Number(m.volume || 0);
+    if (typeof et !== 'string' || !et.trim()) {
+      return { ...m, raw_data: { ...(m.raw_data ?? {}), event_volume: marketVol } };
+    }
+    const fromTotals = totals.get(et.trim());
+    const stored = Number(m.raw_data?.event_volume);
+    const eventVolume =
+      fromTotals != null
+        ? fromTotals
+        : Number.isFinite(stored)
+          ? stored
+          : marketVol;
+    return {
+      ...m,
+      raw_data: {
+        ...(m.raw_data ?? {}),
+        event_volume: eventVolume,
+      },
+    };
+  });
 }
 
 export async function marketRoutes(fastify: FastifyInstance) {
@@ -166,14 +257,15 @@ export async function marketRoutes(fastify: FastifyInstance) {
       metrics: {
         total_active_markets: all.length,
         polymarket_active_count: polymarketCount,
-        polymarket_trend: 'up',
-        polymarket_change_24h: '+3.4%',
+        // 24h deltas need historical snapshots — never invent percentages.
+        polymarket_trend: null,
+        polymarket_change_24h: null,
         kalshi_active_count: kalshiCount,
-        kalshi_trend: 'up',
-        kalshi_change_24h: '+2.1%',
+        kalshi_trend: null,
+        kalshi_change_24h: null,
         total_volume_usd: Math.round(totalVolume),
-        volume_trend: 'up',
-        volume_change_24h: '+8.7%',
+        volume_trend: null,
+        volume_change_24h: null,
         last_updated: new Date().toISOString(),
       },
     });
@@ -198,7 +290,8 @@ export async function marketRoutes(fastify: FastifyInstance) {
     const { data, error } = await dbQuery.limit(limit);
     if (error) return reply.status(500).send({ error: error.message });
 
-    return reply.status(200).send({ movers: (data ?? []).map(formatMarket) });
+    const enriched = await withKalshiEventVolumes(data ?? []);
+    return reply.status(200).send({ movers: enriched.map(formatMarket) });
   });
 
   // 3. GET /api/v1/markets/ending-soon
@@ -220,7 +313,8 @@ export async function marketRoutes(fastify: FastifyInstance) {
     if (error) return reply.status(500).send({ error: error.message });
 
     const now = Date.now();
-    const endingSoon = (data ?? [])
+    const enriched = await withKalshiEventVolumes(data ?? []);
+    const endingSoon = enriched
       .map(formatMarket)
       .filter((m) => m.end_date && new Date(m.end_date).getTime() > now)
       .sort((a, b) => new Date(a.end_date!).getTime() - new Date(b.end_date!).getTime())
@@ -246,7 +340,8 @@ export async function marketRoutes(fastify: FastifyInstance) {
     const { data, error } = await dbQuery;
     if (error) return reply.status(500).send({ error: error.message });
 
-    const allFormatted = (data ?? []).map(formatMarket);
+    const enriched = await withKalshiEventVolumes(data ?? []);
+    const allFormatted = enriched.map(formatMarket);
     const now = Date.now();
 
     let polymarketCount = 0;
@@ -263,14 +358,15 @@ export async function marketRoutes(fastify: FastifyInstance) {
       metrics: {
         total_active_markets: allFormatted.length,
         polymarket_active_count: polymarketCount,
-        polymarket_trend: 'up',
-        polymarket_change_24h: '+3.4%',
+        // 24h deltas need historical snapshots — never invent percentages.
+        polymarket_trend: null,
+        polymarket_change_24h: null,
         kalshi_active_count: kalshiCount,
-        kalshi_trend: 'up',
-        kalshi_change_24h: '+2.1%',
+        kalshi_trend: null,
+        kalshi_change_24h: null,
         total_volume_usd: Math.round(totalVolume),
-        volume_trend: 'up',
-        volume_change_24h: '+8.7%',
+        volume_trend: null,
+        volume_change_24h: null,
         last_updated: new Date().toISOString(),
       },
       movers: [...allFormatted].sort((a, b) => b.volume - a.volume).slice(0, 5),
@@ -298,7 +394,8 @@ export async function marketRoutes(fastify: FastifyInstance) {
     const { data, error } = await dbQuery.range(offset, offset + limit - 1);
     if (error) return reply.status(500).send({ error: error.message });
 
-    return reply.status(200).send({ markets: (data ?? []).map(formatMarket) });
+    const enriched = await withKalshiEventVolumes(data ?? []);
+    return reply.status(200).send({ markets: enriched.map(formatMarket) });
   });
 
   // 6. GET /api/v1/markets/:id
@@ -313,7 +410,8 @@ export async function marketRoutes(fastify: FastifyInstance) {
 
     if (error || !data) return reply.status(404).send({ error: 'Market not found' });
 
-    return reply.status(200).send({ market: formatMarket(data) });
+    const [enriched] = await withKalshiEventVolumes([data]);
+    return reply.status(200).send({ market: formatMarket(enriched) });
   });
 
   // 7. GET /api/v1/markets/:id/orderbook
@@ -327,11 +425,33 @@ export async function marketRoutes(fastify: FastifyInstance) {
     }
   });
 
-  // 8. GET /api/v1/markets/:id/candles
+  // 8. GET /api/v1/markets/:id/candles?resolution=5m|15m|1h|4h|1d|1w
+  // Unknown market → 404 (same as GET /markets/:id). Known market with no
+  // history → 200 + { candles: [] }.
   fastify.get('/api/v1/markets/:id/candles', async (request, reply) => {
     const { id } = request.params as { id: string };
+    const query = request.query as { resolution?: string };
+    const resolutionParam = query.resolution ?? '1h';
+
+    if (!isCandleResolution(resolutionParam)) {
+      return reply.status(400).send({
+        error: `Unsupported resolution "${resolutionParam}". Allowed: ${CANDLE_RESOLUTIONS.join(', ')}`,
+      });
+    }
+
+    const { data: marketRow, error: marketError } = await supabaseAdmin
+      .from('markets')
+      .select('canonical_id')
+      .eq('canonical_id', id)
+      .maybeSingle();
+
+    if (marketError || !marketRow) {
+      return reply.status(404).send({ error: 'Market not found' });
+    }
+
     try {
-      const candles = await candleAggregator.getCandles(id);
+      const candles = await candleAggregator.getCandles(id, resolutionParam as CandleResolution);
+      // Honest empty history: known market with no bars → 200 + []. Never invent OHLCV.
       return reply.status(200).send({ candles });
     } catch (err: any) {
       return reply.status(500).send({ error: err.message });
