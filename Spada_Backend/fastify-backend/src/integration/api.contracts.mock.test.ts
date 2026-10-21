@@ -8,6 +8,8 @@ import assert from 'node:assert/strict';
 import {
   CANDLE_RESOLUTIONS,
   RATIO_KEYS,
+  assertCandleSeries,
+  assertDashboardMetrics,
   assertMarketVolumeFields,
   assertNoSyntheticCandles,
   assertRatioPayload,
@@ -32,6 +34,30 @@ function run() {
     ],
   });
   assert.throws(() => assertNoSyntheticCandles({ candles: [], _tempStatic: true } as any));
+  assertCandleSeries(
+    [
+      { bucket: '2026-01-01T01:00:00.000Z', open: 0.4, high: 0.5, low: 0.3, close: 0.45, volume: 2 },
+      { bucket: '2026-01-01T00:00:00.000Z', open: 0.2, high: 0.4, low: 0.2, close: 0.3, volume: 0 },
+    ],
+    'mock'
+  );
+  assert.throws(() =>
+    assertCandleSeries(
+      [{ bucket: '2026-01-01T00:00:00.000Z', open: 0.9, high: 0.4, low: 0.3, close: 0.45, volume: 1 }],
+      'bad-high'
+    )
+  );
+  assertDashboardMetrics({
+    total_volume_usd: 10,
+    polymarket_active_count: 1,
+    kalshi_active_count: 2,
+    polymarket_trend: null,
+    polymarket_change_24h: null,
+    kalshi_trend: 'up',
+    kalshi_change_24h: '+1.0%',
+    volume_trend: null,
+    volume_change_24h: null,
+  });
 
   assertMarketVolumeFields({ volume: 100, event_volume: 250 });
   assertMarketVolumeFields({ volume: 0, event_volume: null });

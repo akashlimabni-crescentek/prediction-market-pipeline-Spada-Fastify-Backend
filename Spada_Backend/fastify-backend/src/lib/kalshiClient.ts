@@ -9,6 +9,12 @@ const FALLBACK_API_BASE = 'https://external-api.kalshi.com/trade-api/v2';
 /** POC + Kalshi docs: elections host (external-api-ws also supported) */
 export const KALSHI_WS_URL = 'wss://api.elections.kalshi.com/trade-api/ws/v2';
 
+/**
+ * Bound a hung connect. Undici's default is ~10s per host, and the two hosts
+ * used to run one after the other, so one dead proxy held orderbook/ratios ~20s.
+ */
+export const KALSHI_HTTP_TIMEOUT_MS = 4_000;
+
 function loadKalshiCredentials() {
   const apiKeyId = env.KALSHI_API_KEY_ID?.trim();
   const b64 = env.KALSHI_PRIVATE_KEY_B64?.trim();
@@ -55,12 +61,15 @@ export function buildKalshiAuthHeaders(method: string, signPath: string): Record
 
 /**
  * Authenticated GET to Kalshi trade API v2.
+ * Both hosts are tried together; the first successful body wins.
  * @param endpoint e.g. '/markets' or '/markets/{ticker}/orderbook'
  */
 export async function kalshiGet(
   endpoint: string,
-  queryParams: Record<string, string | number | boolean | undefined | null> = {}
+  queryParams: Record<string, string | number | boolean | undefined | null> = {},
+  options: { timeoutMs?: number } = {}
 ): Promise<any> {
+  const timeoutMs = options.timeoutMs ?? KALSHI_HTTP_TIMEOUT_MS;
   const params = Object.fromEntries(
     Object.entries(queryParams).filter(([, value]) => value != null && value !== '')
   );
@@ -77,26 +86,35 @@ export async function kalshiGet(
   };
 
   const hosts = [API_BASE, FALLBACK_API_BASE];
-  let lastError: Error | null = null;
-
-  for (const host of hosts) {
+  const errors: Error[] = [];
+  const attempts = hosts.map(async (host) => {
     const url = `${host}${path}${queryString ? `?${queryString}` : ''}`;
-    try {
-      const response = await fetch(url, { headers });
-      if (!response.ok) {
-        const body = await response.text().catch(() => '');
-        lastError = new Error(
-          `[kalshiClient] GET ${path} ${response.status}${body ? `: ${body.slice(0, 200)}` : ''}`
-        );
-        continue;
+    const response = await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(
+        `[kalshiClient] GET ${path} ${response.status}${body ? `: ${body.slice(0, 200)}` : ''}`
+      );
+    }
+    return response.json();
+  });
+
+  try {
+    return await Promise.any(attempts);
+  } catch (err) {
+    if (err instanceof AggregateError) {
+      for (const e of err.errors) {
+        errors.push(e instanceof Error ? e : new Error(String(e)));
       }
-      return response.json();
-    } catch (err: any) {
-      lastError = err instanceof Error ? err : new Error(String(err));
+    } else {
+      errors.push(err instanceof Error ? err : new Error(String(err)));
     }
   }
 
-  throw lastError ?? new Error(`[kalshiClient] GET ${path} failed`);
+  throw errors[errors.length - 1] ?? new Error(`[kalshiClient] GET ${path} failed`);
 }
 
 export interface KalshiMarketsPageOptions {

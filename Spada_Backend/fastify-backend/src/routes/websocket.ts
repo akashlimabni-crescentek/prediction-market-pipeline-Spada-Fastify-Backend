@@ -1,4 +1,6 @@
 import type { FastifyInstance } from 'fastify';
+import { pinLiveMarket, unpinLiveMarket } from '../lib/livePins.js';
+import { readLiveQuote } from '../lib/liveQuotes.js';
 import { supabaseAdmin } from '../lib/supabase.js';
 
 interface ClientSubscription {
@@ -40,6 +42,7 @@ export async function websocketRoutes(fastify: FastifyInstance) {
 
     if (initialCanonicalId) {
       clientSub.canonicalIds.add(initialCanonicalId);
+      pinLiveMarket(initialCanonicalId);
     }
 
     // Ticket authentication (enforced if provided, bypassable in dev)
@@ -90,22 +93,38 @@ export async function websocketRoutes(fastify: FastifyInstance) {
         const payload = JSON.parse(raw.toString());
 
         if (payload.action === 'subscribe' && payload.canonical_id) {
-          clientSub.canonicalIds.add(payload.canonical_id);
+          const canonicalId = String(payload.canonical_id);
+          const already = clientSub.canonicalIds.has(canonicalId);
+          clientSub.canonicalIds.add(canonicalId);
+          if (!already) pinLiveMarket(canonicalId);
           connection.socket.send(
-            JSON.stringify({ type: 'SUBSCRIBED', canonical_id: payload.canonical_id })
+            JSON.stringify({ type: 'SUBSCRIBED', canonical_id: canonicalId })
           );
+          const prices = readLiveQuote(canonicalId);
+          if (prices) {
+            connection.socket.send(
+              JSON.stringify({
+                type: 'PRICE_UPDATE',
+                canonical_id: canonicalId,
+                prices,
+                timestamp: new Date().toISOString(),
+              })
+            );
+          }
           return;
         }
 
         if (payload.action === 'unsubscribe' && payload.canonical_id) {
-          clientSub.canonicalIds.delete(payload.canonical_id);
+          const canonicalId = String(payload.canonical_id);
+          if (clientSub.canonicalIds.delete(canonicalId)) unpinLiveMarket(canonicalId);
           connection.socket.send(
-            JSON.stringify({ type: 'UNSUBSCRIBED', canonical_id: payload.canonical_id })
+            JSON.stringify({ type: 'UNSUBSCRIBED', canonical_id: canonicalId })
           );
           return;
         }
 
         if (payload.action === 'subscribe_all') {
+          for (const canonicalId of clientSub.canonicalIds) unpinLiveMarket(canonicalId);
           clientSub.canonicalIds.clear();
           connection.socket.send(JSON.stringify({ type: 'SUBSCRIBED_ALL' }));
           return;
@@ -123,6 +142,8 @@ export async function websocketRoutes(fastify: FastifyInstance) {
     });
 
     connection.socket.on('close', () => {
+      for (const canonicalId of clientSub.canonicalIds) unpinLiveMarket(canonicalId);
+      clientSub.canonicalIds.clear();
       connectedClients.delete(clientSub);
     });
   });

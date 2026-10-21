@@ -1,9 +1,13 @@
 import 'dotenv/config';
 import WebSocket from 'ws';
+import { livePinnedIds, watchLivePins } from '../lib/livePins.js';
+import { rememberLiveQuote } from '../lib/liveQuotes.js';
+import { venueLookup } from '../lib/venueDns.js';
 import { supabaseAdmin } from '../lib/supabase.js';
 import { broadcastPriceUpdate } from '../routes/websocket.js';
-import { buildKalshiWsAuthHeaders, KALSHI_WS_URL } from '../lib/kalshiClient.js';
+import { buildKalshiWsAuthHeaders, kalshiGet, KALSHI_WS_URL } from '../lib/kalshiClient.js';
 import { candleAggregator } from '../services/candleAggregator.js';
+import { pricesNeedPersist } from '../lib/pricePersist.js';
 import {
   countRecentTicks,
   formatPriceStreamCoverage,
@@ -38,6 +42,8 @@ const RECONNECT_BASE_MS = 5000;
 
 const updateQueue = new Map<string, PriceUpdate>();
 const marketPrices = new Map<string, number[]>();
+/** Last prices successfully written to markets. Unchanged ticks stay on the socket only. */
+const lastPersistedPrices = new Map<string, number[]>();
 /** Last live tick wall-clock per canonical_id (coverage metrics). */
 const lastTickAtByMarket = new Map<string, number>();
 /** Fair-rotate cursors (in-memory; reset on process restart). */
@@ -48,6 +54,52 @@ let kalshiStreamRotateCursor = 0;
 const tokenToCanonicalMap = new Map<string, TokenMapping>();
 /** Kalshi ticker → canonical_id */
 const tickerToCanonicalMap = new Map<string, string>();
+
+interface ResolvedPin {
+  canonicalId: string;
+  platform: 'kalshi' | 'polymarket';
+  ticker: string | null;
+  tokens: Array<{ id: string; outcomeIndex: number; isMulti: boolean }>;
+  prices: number[] | null;
+}
+
+/** Markets a browser currently has open. Kept across the 5-minute rotation. */
+const resolvedPins = new Map<string, ResolvedPin>();
+const pinLoads = new Map<string, Promise<void>>();
+
+function mergePinnedKalshiTickers(tickers: string[]): void {
+  for (const pin of resolvedPins.values()) {
+    if (pin.platform !== 'kalshi' || !pin.ticker) continue;
+    if (!tickerToCanonicalMap.has(pin.ticker)) {
+      tickers.push(pin.ticker);
+      tickerToCanonicalMap.set(pin.ticker, pin.canonicalId);
+    }
+    if (!marketPrices.has(pin.canonicalId)) {
+      marketPrices.set(pin.canonicalId, pin.prices ?? [0.5, 0.5]);
+    }
+  }
+}
+
+function mergePinnedPolymarketTokens(assetIds: string[]): void {
+  for (const pin of resolvedPins.values()) {
+    if (pin.platform !== 'polymarket') continue;
+    if (!marketPrices.has(pin.canonicalId)) {
+      marketPrices.set(
+        pin.canonicalId,
+        pin.prices ?? new Array(Math.max(pin.tokens.length, 2)).fill(0)
+      );
+    }
+    for (const token of pin.tokens) {
+      if (tokenToCanonicalMap.has(token.id)) continue;
+      assetIds.push(token.id);
+      tokenToCanonicalMap.set(token.id, {
+        canonicalId: pin.canonicalId,
+        outcomeIndex: token.outcomeIndex,
+        isMulti: token.isMulti,
+      });
+    }
+  }
+}
 
 const RECENT_TICK_WINDOW_MS = 5 * 60_000;
 
@@ -66,8 +118,10 @@ function clampProb(n: number): number | null {
 }
 
 function queuePriceUpdate(canonicalId: string, prices: number[]) {
-  marketPrices.set(canonicalId, prices);
-  updateQueue.set(canonicalId, { canonicalId, prices: [...prices] });
+  const next = [...prices];
+  marketPrices.set(canonicalId, next);
+  rememberLiveQuote(canonicalId, next);
+  updateQueue.set(canonicalId, { canonicalId, prices: [...next] });
 }
 
 function recordPolymarketPrice(
@@ -155,6 +209,10 @@ function extractKalshiTradePrice(payload: Record<string, any>): number | null {
     const cents = Number(payload.price ?? payload.yes_price);
     if (Number.isFinite(cents) && cents > 0) return cents / 100;
   }
+  if (payload.last_price_dollars != null) {
+    const last = Number(payload.last_price_dollars);
+    if (Number.isFinite(last) && last >= 0 && last <= 1) return last;
+  }
   return extractKalshiMidpoint(payload);
 }
 
@@ -201,7 +259,7 @@ async function loadWatchlistIdsForPlatform(
 async function countActiveMarkets(platform: 'polymarket' | 'kalshi'): Promise<number | null> {
   const { count, error } = await supabaseAdmin
     .from('markets')
-    .select('*', { count: 'exact', head: true })
+    .select('canonical_id', { count: 'estimated', head: true })
     .eq('platform', platform)
     .eq('active', true);
   if (error) return null;
@@ -212,34 +270,21 @@ async function loadStreamMarketPools(
   platform: 'polymarket' | 'kalshi',
   pageSize: number
 ): Promise<{ highVolume: StreamMarketRow[]; rotatePool: StreamMarketRow[] }> {
-  const volumeLimit = Math.max(pageSize, Math.min(pageSize * 2, 300));
   const rotateLimit = Math.max(pageSize, Math.min(pageSize * 4, 600));
 
+  // Order by the primary key. ORDER BY volume scans and sorts the whole
+  // catalogue and was cancelled by the database statement timeout.
   const selectCols =
-    platform === 'polymarket'
-      ? 'canonical_id, platform, external_id, volume, active, updated_at, prices, raw_data'
-      : 'canonical_id, platform, external_id, volume, active, updated_at, prices';
+    'canonical_id, platform, external_id, volume, active, updated_at, prices';
 
-  const [volRes, rotRes] = await Promise.all([
-    supabaseAdmin
-      .from('markets')
-      .select(selectCols)
-      .eq('platform', platform)
-      .eq('active', true)
-      .order('volume', { ascending: false })
-      .limit(volumeLimit),
-    supabaseAdmin
-      .from('markets')
-      .select(selectCols)
-      .eq('platform', platform)
-      .eq('active', true)
-      .order('canonical_id', { ascending: true })
-      .limit(rotateLimit),
-  ]);
+  const rotRes = await supabaseAdmin
+    .from('markets')
+    .select(selectCols)
+    .eq('platform', platform)
+    .eq('active', true)
+    .order('canonical_id', { ascending: true })
+    .limit(rotateLimit);
 
-  if (volRes.error) {
-    console.error(`[Price Stream][${platform}] volume pool:`, volRes.error.message);
-  }
   if (rotRes.error) {
     console.error(`[Price Stream][${platform}] rotate pool:`, rotRes.error.message);
   }
@@ -253,14 +298,42 @@ async function loadStreamMarketPools(
     updated_at: m.updated_at != null ? String(m.updated_at) : null,
     meta: {
       prices: m.prices,
-      raw_data: m.raw_data ?? null,
     },
   });
 
-  return {
-    highVolume: (volRes.data ?? []).map(toRow),
-    rotatePool: (rotRes.data ?? []).map(toRow),
-  };
+  const rotatePool = (rotRes.data ?? []).map(toRow);
+  const highVolume = [...rotatePool].sort(
+    (a, b) => Number(b.volume ?? 0) - Number(a.volume ?? 0)
+  );
+  return { highVolume, rotatePool };
+}
+
+/** CLOB token ids for the markets actually subscribed, not the whole candidate pool. */
+async function loadPolymarketClobTokens(
+  ids: string[]
+): Promise<Map<string, Record<string, unknown>>> {
+  const out = new Map<string, Record<string, unknown>>();
+  const unique = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+  for (const chunk of chunkArray(unique, 50)) {
+    const { data, error } = await supabaseAdmin
+      .from('markets')
+      .select('canonical_id, clob_token_ids:raw_data->clobTokenIds, tokens:raw_data->tokens')
+      .in('canonical_id', chunk);
+    if (error) {
+      console.warn(
+        '[Price Stream][polymarket] token lookup:',
+        error.message.slice(0, 160)
+      );
+      continue;
+    }
+    for (const row of data ?? []) {
+      out.set(String(row.canonical_id), {
+        clobTokenIds: row.clob_token_ids,
+        tokens: row.tokens,
+      });
+    }
+  }
+  return out;
 }
 
 /**
@@ -290,8 +363,12 @@ async function loadActivePolymarketMarkets(): Promise<string[]> {
     tokenToCanonicalMap.delete(key);
   }
 
+  const tokenRaw = await loadPolymarketClobTokens(
+    selection.markets.map((market) => market.canonical_id)
+  );
+
   for (const market of selection.markets) {
-    const raw = (market.meta?.raw_data as Record<string, unknown> | null) ?? {};
+    const raw = tokenRaw.get(market.canonical_id) ?? {};
     const prices = market.meta?.prices;
     const canonicalId = market.canonical_id;
     const isMulti = canonicalId.includes('_event_');
@@ -315,6 +392,7 @@ async function loadActivePolymarketMarkets(): Promise<string[]> {
     });
   }
 
+  mergePinnedPolymarketTokens(assetIds);
   const subscribed = [...new Set(assetIds)];
   console.log(
     formatPriceStreamCoverage({
@@ -373,6 +451,8 @@ async function loadActiveKalshiTickers(): Promise<string[]> {
       );
     }
   }
+
+  mergePinnedKalshiTickers(tickers);
 
   console.log(
     formatPriceStreamCoverage({
@@ -563,7 +643,7 @@ async function connectPolymarketStream(): Promise<void> {
   }
 
   console.log(`[Price Stream][Polymarket] connecting ${POLY_WS_URL} (${assetIds.length} tokens)`);
-  const ws = new WebSocket(POLY_WS_URL);
+  const ws = new WebSocket(POLY_WS_URL, { lookup: venueLookup });
   polyWs = ws;
 
   ws.on('open', async () => {
@@ -632,6 +712,8 @@ let kalshiWs: WebSocket | null = null;
 let kalshiRefreshTimer: NodeJS.Timeout | undefined;
 let kalshiSubscribed = new Set<string>();
 let kalshiChannelSids = new Map<string, number>();
+/** Tickers pinned before the Kalshi subscribe ack (sid) exists. */
+const pendingKalshiAdds = new Set<string>();
 let kalshiMsgId = 1;
 let kalshiReconnectAttempt = 0;
 
@@ -669,6 +751,157 @@ function updateKalshiSubscription(ws: WebSocket, action: 'add_markets' | 'delete
   }
 }
 
+function flushPendingKalshiAdds(): void {
+  if (!pendingKalshiAdds.size || kalshiWs?.readyState !== WebSocket.OPEN || kalshiChannelSids.size === 0) {
+    return;
+  }
+  const tickers = [...pendingKalshiAdds];
+  pendingKalshiAdds.clear();
+  updateKalshiSubscription(kalshiWs!, 'add_markets', tickers);
+  console.log(`[Price Stream][Kalshi] pinned ${tickers.join(',')}`);
+}
+
+function pushKalshiPin(ticker: string): void {
+  if (!ticker || kalshiSubscribed.has(ticker)) return;
+  kalshiSubscribed.add(ticker);
+  if (kalshiWs?.readyState !== WebSocket.OPEN || kalshiChannelSids.size === 0) {
+    pendingKalshiAdds.add(ticker);
+    return;
+  }
+  updateKalshiSubscription(kalshiWs, 'add_markets', [ticker]);
+  console.log(`[Price Stream][Kalshi] pinned ${ticker}`);
+}
+
+function pushPolymarketPin(tokenIds: string[]): void {
+  const fresh = tokenIds.filter((id) => id && !polySubscribed.has(id));
+  if (!fresh.length) return;
+  for (const id of fresh) polySubscribed.add(id);
+  if (polyWs?.readyState === WebSocket.OPEN) {
+    subscribePolymarketTokens(polyWs, fresh, false);
+    console.log(`[Price Stream][Polymarket] pinned ${fresh.length} token(s)`);
+  }
+}
+
+function seedKalshiPin(ticker: string): void {
+  void kalshiGet(`/markets/${encodeURIComponent(ticker)}`)
+    .then((body: any) => {
+      const market = body?.market ?? body ?? {};
+      const mid = extractKalshiMidpoint(market) ?? extractKalshiTradePrice(market);
+      if (mid == null) {
+        console.warn(
+          `[Price Stream][Kalshi] pin snapshot ${ticker} has no price keys=${Object.keys(market).slice(0, 12).join(',')}`
+        );
+        return;
+      }
+      console.log(`[Price Stream][Kalshi] pin snapshot ${ticker} mid=${mid}`);
+      recordKalshiYesPrice(ticker, mid);
+    })
+    .catch((err: any) => {
+      console.warn(`[Price Stream][Kalshi] pin snapshot ${ticker}:`, err?.message ?? err);
+    });
+}
+
+function applyResolvedPin(pin: ResolvedPin): void {
+  if (pin.platform === 'kalshi' && pin.ticker) {
+    tickerToCanonicalMap.set(pin.ticker, pin.canonicalId);
+    if (!marketPrices.has(pin.canonicalId)) {
+      marketPrices.set(pin.canonicalId, pin.prices ?? [0.5, 0.5]);
+    }
+    if (pin.prices?.some((price) => Number.isFinite(price) && price > 0)) {
+      queuePriceUpdate(pin.canonicalId, pin.prices);
+    }
+    pushKalshiPin(pin.ticker);
+    seedKalshiPin(pin.ticker);
+    return;
+  }
+  if (pin.platform !== 'polymarket') return;
+  if (!marketPrices.has(pin.canonicalId)) {
+    marketPrices.set(
+      pin.canonicalId,
+      pin.prices ?? new Array(Math.max(pin.tokens.length, 2)).fill(0)
+    );
+  }
+  for (const token of pin.tokens) {
+    tokenToCanonicalMap.set(token.id, {
+      canonicalId: pin.canonicalId,
+      outcomeIndex: token.outcomeIndex,
+      isMulti: token.isMulti,
+    });
+  }
+  const prices = pin.prices ?? [];
+  if (prices.some((price) => Number.isFinite(price) && price > 0)) {
+    queuePriceUpdate(pin.canonicalId, prices);
+  }
+  pushPolymarketPin(pin.tokens.map((token) => token.id));
+}
+
+async function loadAndApplyPin(canonicalId: string): Promise<void> {
+  const { data, error } = await supabaseAdmin
+    .from('markets')
+    .select('canonical_id, platform, external_id, prices, raw_data')
+    .eq('canonical_id', canonicalId)
+    .maybeSingle();
+
+  if (!livePinnedIds().includes(canonicalId)) return;
+  if (error || !data) {
+    console.warn(`[Price Stream] pin miss ${canonicalId}: ${error?.message ?? 'not in markets'}`);
+    return;
+  }
+
+  const platform = String(data.platform);
+  const prices = Array.isArray(data.prices)
+    ? (data.prices as unknown[]).map((price) => Number(price))
+    : null;
+
+  if (platform === 'kalshi') {
+    const ticker = String(data.external_id || canonicalId.replace(/^kalshi_/, '')).trim();
+    if (!ticker) return;
+    const pin: ResolvedPin = {
+      canonicalId,
+      platform: 'kalshi',
+      ticker,
+      tokens: [],
+      prices,
+    };
+    resolvedPins.set(canonicalId, pin);
+    applyResolvedPin(pin);
+    return;
+  }
+
+  if (platform !== 'polymarket') return;
+  const tokens = parseTokenIds(data.raw_data ?? {});
+  const isMulti = canonicalId.includes('_event_') || tokens.length > 2;
+  const subscribeTokens = (isMulti ? tokens : tokens.slice(0, 1)).filter(Boolean);
+  const pin: ResolvedPin = {
+    canonicalId,
+    platform: 'polymarket',
+    ticker: null,
+    tokens: subscribeTokens.map((id, outcomeIndex) => ({ id, outcomeIndex, isMulti })),
+    prices,
+  };
+  resolvedPins.set(canonicalId, pin);
+  applyResolvedPin(pin);
+}
+
+function attachPinnedMarket(canonicalId: string): Promise<void> {
+  const existing = resolvedPins.get(canonicalId);
+  if (existing) {
+    applyResolvedPin(existing);
+    return Promise.resolve();
+  }
+  const inflight = pinLoads.get(canonicalId);
+  if (inflight) return inflight;
+  const job = loadAndApplyPin(canonicalId).finally(() => {
+    pinLoads.delete(canonicalId);
+  });
+  pinLoads.set(canonicalId, job);
+  return job;
+}
+
+function detachPinnedMarket(canonicalId: string): void {
+  resolvedPins.delete(canonicalId);
+}
+
 async function refreshKalshiSubscriptions(initial = false) {
   const nextTickers = await loadActiveKalshiTickers();
   const nextSet = new Set(nextTickers);
@@ -690,6 +923,8 @@ async function refreshKalshiSubscriptions(initial = false) {
   );
 }
 
+let kalshiDropsLogged = 0;
+
 function handleKalshiMessage(raw: string) {
   let msg: any;
   try {
@@ -704,6 +939,7 @@ function handleKalshiMessage(raw: string) {
       const sid = msg.msg?.sid ?? msg.sid;
       if (channel && sid != null) {
         kalshiChannelSids.set(channel, sid);
+        flushPendingKalshiAdds();
       }
       break;
     }
@@ -713,7 +949,15 @@ function handleKalshiMessage(raw: string) {
       if (!ticker) break;
       // Live chart: bid/ask midpoint only (same principle as Polymarket CLOB mid).
       const mid = extractKalshiMidpoint(payload);
-      if (mid == null) break;
+      if (mid == null) {
+        if (kalshiDropsLogged < 5) {
+          kalshiDropsLogged += 1;
+          console.warn(
+            `[Price Stream][Kalshi] ticker without mid ${ticker} bid=${payload.yes_bid_dollars ?? payload.yes_bid} ask=${payload.yes_ask_dollars ?? payload.yes_ask}`
+          );
+        }
+        break;
+      }
       recordKalshiYesPrice(ticker, mid);
       break;
     }
@@ -774,7 +1018,7 @@ async function connectKalshiStream(): Promise<void> {
   }
 
   console.log(`[Price Stream][Kalshi] connecting ${KALSHI_WS_URL} (${tickers.length} tickers)`);
-  const ws = new WebSocket(KALSHI_WS_URL, { headers });
+  const ws = new WebSocket(KALSHI_WS_URL, { headers, lookup: venueLookup });
   kalshiWs = ws;
   kalshiChannelSids.clear();
   kalshiMsgId = 1;
@@ -844,8 +1088,11 @@ async function flushPriceUpdates(): Promise<void> {
 
   // Secondary: persist in small concurrent batches (avoids Cloudflare 520 from burst updates)
   const CONCURRENCY = 8;
-  for (let i = 0; i < updates.length; i += CONCURRENCY) {
-    const slice = updates.slice(i, i + CONCURRENCY);
+  const toWrite = updates.filter((update) =>
+    pricesNeedPersist(lastPersistedPrices.get(update.canonicalId), update.prices)
+  );
+  for (let i = 0; i < toWrite.length; i += CONCURRENCY) {
+    const slice = toWrite.slice(i, i + CONCURRENCY);
     const results = await Promise.all(
       slice.map(async (update) => {
         const { error } = await supabaseAdmin
@@ -855,6 +1102,7 @@ async function flushPriceUpdates(): Promise<void> {
             updated_at: timestamp,
           })
           .eq('canonical_id', update.canonicalId);
+        if (!error) lastPersistedPrices.set(update.canonicalId, [...update.prices]);
         return error;
       })
     );
@@ -875,6 +1123,10 @@ async function flushPriceUpdates(): Promise<void> {
 
 export function startPriceStreamWorker(): void {
   console.log('[Price Stream] starting Polymarket + Kalshi exchange WebSockets → Fastify /api/v1/ws');
+  watchLivePins((canonicalId, pinned) => {
+    if (pinned) void attachPinnedMarket(canonicalId);
+    else detachPinnedMarket(canonicalId);
+  });
   connectPolymarketStream().catch(console.error);
   connectKalshiStream().catch(console.error);
   setInterval(() => flushPriceUpdates().catch(console.error), FLUSH_MS);

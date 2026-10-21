@@ -1,3 +1,4 @@
+import './lib/venueDns.js';
 import Fastify from 'fastify';
 import fastifyCors from '@fastify/cors';
 import fastifyWebsocket from '@fastify/websocket';

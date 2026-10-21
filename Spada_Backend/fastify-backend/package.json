@@ -15,11 +15,13 @@
     "test:poly-trades": "tsx src/lib/polyTradesSync.test.ts",
     "test:candle-sync-plan": "tsx src/lib/candleSyncPlan.test.ts",
     "test:price-stream-plan": "tsx src/lib/priceStreamPlan.test.ts",
+    "test:price-persist": "tsx src/lib/pricePersist.test.ts",
     "test:orderbook": "tsx src/lib/orderbookPersist.test.ts",
-    "test:unit": "npm run test:ratios && npm run test:matching && npm run test:candles && npm run test:candles-contract && npm run test:poly-trades && npm run test:candle-sync-plan && npm run test:price-stream-plan && npm run test:orderbook",
+    "test:dashboard-metrics": "tsx src/lib/dashboardMetrics.test.ts",
+    "test:unit": "npm run test:ratios && npm run test:matching && npm run test:candles && npm run test:candles-contract && npm run test:poly-trades && npm run test:candle-sync-plan && npm run test:price-stream-plan && npm run test:price-persist && npm run test:orderbook && npm run test:dashboard-metrics",
     "test:integration:mock": "tsx src/integration/api.contracts.mock.test.ts",
     "test:integration": "tsx src/integration/api.live.integration.test.ts",
-    "test": "npm run test:unit && npm run test:integration:mock && npm run test:integration"
+    "test": "npm run test:unit && npm run test:integration:mock"
   },
   "dependencies": {
     "@fastify/cors": "^9.0.0",

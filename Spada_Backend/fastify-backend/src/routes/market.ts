@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { supabaseAdmin } from '../lib/supabase.js';
+import { loadAndUpdateDashboardTrends } from '../lib/dashboardMetrics.js';
 import { orderbookStore } from '../services/orderbookStore.js';
 import {
   candleAggregator,
@@ -7,6 +8,16 @@ import {
   isCandleResolution,
   type CandleResolution,
 } from '../services/candleAggregator.js';
+
+/** Chart outcome index. Missing means the primary series (unchanged). */
+function parseOutcomeIndex(raw: string | undefined): number | null {
+  if (raw == null || raw === '') return 0;
+  if (!/^\d+$/.test(raw)) return null;
+  const n = Number(raw);
+  // Events can list well over 64 outcomes (a college game book had 215).
+  if (!Number.isInteger(n) || n < 0 || n > 1024) return null;
+  return n;
+}
 
 function parseArrayField(val: any): any[] {
   if (Array.isArray(val)) return val;
@@ -158,244 +169,269 @@ function resolvePlatformParam(query: Record<string, any>): string | null {
   return null;
 }
 
-/**
- * Resolve Kalshi event_volume at read time:
- * sum of active market volumes sharing raw_data.event_ticker.
- * Prefer row volumes from `rows` when present (fresher than sibling DB rows).
- * Polymarket rows are unchanged (formatMarket falls back to markets.volume).
- */
-async function withKalshiEventVolumes(rows: any[]): Promise<any[]> {
-  if (!rows.length) return rows;
+const MARKET_CARD_COLUMNS = [
+  'canonical_id',
+  'platform',
+  'external_id',
+  'title',
+  'category',
+  'outcomes',
+  'prices',
+  'volume',
+  'active',
+  'ai_summary',
+  'ai_sentiment_label',
+  'ai_last_updated',
+  'updated_at',
+  'raw_end_date:raw_data->end_date',
+  'raw_endDate:raw_data->endDate',
+  'raw_endDateIso:raw_data->endDateIso',
+  'raw_close_time:raw_data->close_time',
+  'raw_expiration_time:raw_data->expiration_time',
+  'raw_slug:raw_data->slug',
+  'raw_market_url:raw_data->market_url',
+  'raw_event_ticker:raw_data->event_ticker',
+  'raw_event_volume:raw_data->event_volume',
+  'raw_ticker:raw_data->ticker',
+].join(', ');
 
-  const eventTickers = new Set<string>();
-  for (const m of rows) {
-    if (m.platform !== 'kalshi') continue;
-    const et = m.raw_data?.event_ticker;
-    if (typeof et === 'string' && et.trim()) eventTickers.add(et.trim());
-  }
-  if (eventTickers.size === 0) return rows;
-
-  const rowById = new Map(rows.map((m) => [m.canonical_id, m]));
-  const totals = new Map<string, number>();
-  const tickers = [...eventTickers];
-
-  for (let i = 0; i < tickers.length; i += 30) {
-    const chunk = tickers.slice(i, i + 30);
-    try {
-      const { data, error } = await supabaseAdmin
-        .from('markets')
-        .select('canonical_id, volume, raw_data')
-        .eq('platform', 'kalshi')
-        .eq('active', true)
-        .filter('raw_data->>event_ticker', 'in', `(${chunk.join(',')})`);
-
-      if (error) {
-        console.warn('[markets] Kalshi event volume lookup:', error.message);
-        continue;
-      }
-
-      for (const row of data ?? []) {
-        const et = row.raw_data?.event_ticker;
-        if (typeof et !== 'string' || !et) continue;
-        const live = rowById.get(row.canonical_id);
-        const vol = Number((live ?? row).volume || 0);
-        if (!Number.isFinite(vol)) continue;
-        totals.set(et, (totals.get(et) ?? 0) + vol);
-      }
-    } catch (err: any) {
-      console.warn('[markets] Kalshi event volume lookup failed:', err?.message ?? err);
-    }
-  }
-
-  return rows.map((m) => {
-    if (m.platform !== 'kalshi') return m;
-    const et = m.raw_data?.event_ticker;
-    const marketVol = Number(m.volume || 0);
-    if (typeof et !== 'string' || !et.trim()) {
-      return { ...m, raw_data: { ...(m.raw_data ?? {}), event_volume: marketVol } };
-    }
-    const fromTotals = totals.get(et.trim());
-    const stored = Number(m.raw_data?.event_volume);
-    const eventVolume =
-      fromTotals != null
-        ? fromTotals
-        : Number.isFinite(stored)
-          ? stored
-          : marketVol;
-    return {
-      ...m,
-      raw_data: {
-        ...(m.raw_data ?? {}),
-        event_volume: eventVolume,
-      },
-    };
+function formatCardRow(row: any) {
+  return formatMarket({
+    ...row,
+    raw_data: {
+      end_date: row.raw_end_date ?? null,
+      endDate: row.raw_endDate ?? null,
+      endDateIso: row.raw_endDateIso ?? null,
+      close_time: row.raw_close_time ?? null,
+      expiration_time: row.raw_expiration_time ?? null,
+      slug: row.raw_slug ?? null,
+      market_url: row.raw_market_url ?? null,
+      event_ticker: row.raw_event_ticker ?? null,
+      event_volume: row.raw_event_volume ?? null,
+      ticker: row.raw_ticker ?? null,
+    },
   });
+}
+
+/** Date keys only. Ending-soon does not need AI text or the rest of raw_data. */
+const ENDING_SOON_COLUMNS = [
+  'canonical_id',
+  'platform',
+  'external_id',
+  'title',
+  'category',
+  'outcomes',
+  'prices',
+  'volume',
+  'active',
+  'updated_at',
+  'raw_end_date:raw_data->end_date',
+  'raw_endDate:raw_data->endDate',
+  'raw_endDateIso:raw_data->endDateIso',
+  'raw_close_time:raw_data->close_time',
+  'raw_expiration_time:raw_data->expiration_time',
+].join(', ');
+
+const DASHBOARD_CACHE_MS = 60_000;
+const dashboardCache = new Map<string, { at: number; value: unknown }>();
+
+function readDashboardCache<T>(key: string): T | null {
+  const hit = dashboardCache.get(key);
+  if (!hit || Date.now() - hit.at >= DASHBOARD_CACHE_MS) return null;
+  return hit.value as T;
+}
+
+function writeDashboardCache(key: string, value: unknown) {
+  dashboardCache.set(key, { at: Date.now(), value });
+}
+
+async function loadMetrics() {
+  const cached = readDashboardCache<Record<string, unknown>>('metrics');
+  if (cached) return cached;
+
+  const { data: markets, error } = await supabaseAdmin
+    .from('markets')
+    .select('platform, volume')
+    .eq('active', true);
+  if (error) throw new Error(error.message);
+
+  const all = markets ?? [];
+  let polymarketCount = 0;
+  let kalshiCount = 0;
+  let totalVolume = 0;
+  for (const m of all) {
+    if (m.platform === 'polymarket') polymarketCount++;
+    if (m.platform === 'kalshi') kalshiCount++;
+    totalVolume += Number(m.volume || 0);
+  }
+
+  const totalVolumeUsd = Math.round(totalVolume);
+  const trends = await loadAndUpdateDashboardTrends({
+    polymarketActive: polymarketCount,
+    kalshiActive: kalshiCount,
+    totalVolumeUsd,
+  });
+  const metrics = {
+    total_active_markets: all.length,
+    polymarket_active_count: polymarketCount,
+    polymarket_trend: trends.polymarket_trend,
+    polymarket_change_24h: trends.polymarket_change_24h,
+    kalshi_active_count: kalshiCount,
+    kalshi_trend: trends.kalshi_trend,
+    kalshi_change_24h: trends.kalshi_change_24h,
+    total_volume_usd: totalVolumeUsd,
+    volume_trend: trends.volume_trend,
+    volume_change_24h: trends.volume_change_24h,
+    last_updated: new Date().toISOString(),
+  };
+  writeDashboardCache('metrics', metrics);
+  return metrics;
+}
+
+async function loadMovers(platform: string | null, category: string, limit: number) {
+  const safeLimit = Math.min(Math.max(limit || 5, 1), 20);
+  const cacheKey = `movers:${platform ?? ''}:${category}:${safeLimit}`;
+  const cached = readDashboardCache<any[]>(cacheKey);
+  if (cached) return cached;
+
+  // Rank on the volume column only. Pulling card JSON into this sort reads
+  // the large raw_data payload for the whole catalogue.
+  let idQuery = supabaseAdmin
+    .from('markets')
+    .select('canonical_id')
+    .eq('active', true)
+    .order('volume', { ascending: false });
+  if (platform) idQuery = idQuery.eq('platform', platform);
+  if (category) idQuery = idQuery.ilike('category', `%${category}%`);
+
+  const { data: idRows, error } = await idQuery.limit(safeLimit);
+  if (error) throw new Error(error.message);
+
+  const ids = (idRows ?? []).map((row) => String(row.canonical_id)).filter(Boolean);
+  if (!ids.length) {
+    writeDashboardCache(cacheKey, []);
+    return [];
+  }
+
+  const { data, error: cardError } = await supabaseAdmin
+    .from('markets')
+    .select(MARKET_CARD_COLUMNS)
+    .in('canonical_id', ids);
+  if (cardError) throw new Error(cardError.message);
+
+  const byId = new Map((data ?? []).map((row) => [String(row.canonical_id), formatCardRow(row)]));
+  const movers = ids.map((id) => byId.get(id)).filter(Boolean);
+  writeDashboardCache(cacheKey, movers);
+  return movers;
+}
+
+async function loadEndingSoon(platform: string | null, category: string, limit: number) {
+  const safeLimit = Math.min(Math.max(limit || 5, 1), 20);
+  const cacheKey = `ending:${platform ?? ''}:${category}:${safeLimit}`;
+  const cached = readDashboardCache<any[]>(cacheKey);
+  if (cached) return cached;
+
+  let dbQuery = supabaseAdmin.from('markets').select(ENDING_SOON_COLUMNS).eq('active', true);
+  if (platform) dbQuery = dbQuery.eq('platform', platform);
+  if (category) dbQuery = dbQuery.ilike('category', `%${category}%`);
+
+  const { data, error } = await dbQuery;
+  if (error) throw new Error(error.message);
+
+  const now = Date.now();
+  const endingSoon = (data ?? [])
+    .map(formatCardRow)
+    .filter((m) => m.end_date && new Date(m.end_date).getTime() > now)
+    .sort((a, b) => new Date(a.end_date!).getTime() - new Date(b.end_date!).getTime())
+    .slice(0, safeLimit);
+  writeDashboardCache(cacheKey, endingSoon);
+  return endingSoon;
 }
 
 export async function marketRoutes(fastify: FastifyInstance) {
   // 1. GET /api/v1/markets/metrics
   fastify.get('/api/v1/markets/metrics', async (_request, reply) => {
-    const { data: markets, error } = await supabaseAdmin
-      .from('markets')
-      .select('platform, volume, active')
-      .eq('active', true);
-
-    if (error) return reply.status(500).send({ error: error.message });
-
-    const all = markets ?? [];
-    let polymarketCount = 0;
-    let kalshiCount = 0;
-    let totalVolume = 0;
-
-    for (const m of all) {
-      if (m.platform === 'polymarket') polymarketCount++;
-      if (m.platform === 'kalshi') kalshiCount++;
-      totalVolume += Number(m.volume || 0);
+    try {
+      const metrics = await loadMetrics();
+      return reply.status(200).send({ metrics });
+    } catch (err: any) {
+      return reply.status(500).send({ error: err.message });
     }
-
-    return reply.status(200).send({
-      metrics: {
-        total_active_markets: all.length,
-        polymarket_active_count: polymarketCount,
-        // 24h deltas need historical snapshots — never invent percentages.
-        polymarket_trend: null,
-        polymarket_change_24h: null,
-        kalshi_active_count: kalshiCount,
-        kalshi_trend: null,
-        kalshi_change_24h: null,
-        total_volume_usd: Math.round(totalVolume),
-        volume_trend: null,
-        volume_change_24h: null,
-        last_updated: new Date().toISOString(),
-      },
-    });
   });
 
   // 2. GET /api/v1/markets/movers
   fastify.get('/api/v1/markets/movers', async (request, reply) => {
     const query = request.query as Record<string, any>;
     const platform = resolvePlatformParam(query);
-    const category = query.category;
+    const category = typeof query.category === 'string' ? query.category.trim() : '';
     const limit = parseInt(query.limit || '5', 10);
-
-    let dbQuery = supabaseAdmin
-      .from('markets')
-      .select('canonical_id, platform, external_id, title, category, outcomes, prices, volume, active, raw_data, ai_summary, ai_sentiment_label, ai_last_updated, updated_at')
-      .eq('active', true)
-      .order('volume', { ascending: false });
-
-    if (platform) dbQuery = dbQuery.eq('platform', platform);
-    if (category) dbQuery = dbQuery.ilike('category', `%${category.trim()}%`);
-
-    const { data, error } = await dbQuery.limit(limit);
-    if (error) return reply.status(500).send({ error: error.message });
-
-    const enriched = await withKalshiEventVolumes(data ?? []);
-    return reply.status(200).send({ movers: enriched.map(formatMarket) });
+    try {
+      const movers = await loadMovers(platform, category, limit);
+      return reply.status(200).send({ movers });
+    } catch (err: any) {
+      return reply.status(500).send({ error: err.message });
+    }
   });
 
   // 3. GET /api/v1/markets/ending-soon
   fastify.get('/api/v1/markets/ending-soon', async (request, reply) => {
     const query = request.query as Record<string, any>;
     const platform = resolvePlatformParam(query);
-    const category = query.category;
+    const category = typeof query.category === 'string' ? query.category.trim() : '';
     const limit = parseInt(query.limit || '5', 10);
-
-    let dbQuery = supabaseAdmin
-      .from('markets')
-      .select('canonical_id, platform, external_id, title, category, outcomes, prices, volume, active, raw_data, ai_summary, ai_sentiment_label, ai_last_updated, updated_at')
-      .eq('active', true);
-
-    if (platform) dbQuery = dbQuery.eq('platform', platform);
-    if (category) dbQuery = dbQuery.ilike('category', `%${category.trim()}%`);
-
-    const { data, error } = await dbQuery;
-    if (error) return reply.status(500).send({ error: error.message });
-
-    const now = Date.now();
-    const enriched = await withKalshiEventVolumes(data ?? []);
-    const endingSoon = enriched
-      .map(formatMarket)
-      .filter((m) => m.end_date && new Date(m.end_date).getTime() > now)
-      .sort((a, b) => new Date(a.end_date!).getTime() - new Date(b.end_date!).getTime())
-      .slice(0, limit);
-
-    return reply.status(200).send({ ending_soon: endingSoon });
+    try {
+      const endingSoon = await loadEndingSoon(platform, category, limit);
+      return reply.status(200).send({ ending_soon: endingSoon });
+    } catch (err: any) {
+      return reply.status(500).send({ error: err.message });
+    }
   });
 
   // 4. GET /api/v1/markets/dashboard-overview
   fastify.get('/api/v1/markets/dashboard-overview', async (request, reply) => {
     const query = request.query as Record<string, any>;
     const platform = resolvePlatformParam(query);
-    const category = query.category;
-
-    let dbQuery = supabaseAdmin
-      .from('markets')
-      .select('canonical_id, platform, external_id, title, category, outcomes, prices, volume, active, raw_data, ai_summary, ai_sentiment_label, ai_last_updated, updated_at')
-      .eq('active', true);
-
-    if (platform) dbQuery = dbQuery.eq('platform', platform);
-    if (category) dbQuery = dbQuery.ilike('category', `%${category.trim()}%`);
-
-    const { data, error } = await dbQuery;
-    if (error) return reply.status(500).send({ error: error.message });
-
-    const enriched = await withKalshiEventVolumes(data ?? []);
-    const allFormatted = enriched.map(formatMarket);
-    const now = Date.now();
-
-    let polymarketCount = 0;
-    let kalshiCount = 0;
-    let totalVolume = 0;
-
-    for (const m of allFormatted) {
-      if (m.platform === 'polymarket') polymarketCount++;
-      if (m.platform === 'kalshi') kalshiCount++;
-      totalVolume += m.volume;
+    const category = typeof query.category === 'string' ? query.category.trim() : '';
+    try {
+      const [metrics, movers, endingSoon] = await Promise.all([
+        loadMetrics(),
+        loadMovers(platform, category, 5),
+        loadEndingSoon(platform, category, 5),
+      ]);
+      return reply.status(200).send({
+        metrics,
+        movers,
+        ending_soon: endingSoon,
+      });
+    } catch (err: any) {
+      return reply.status(500).send({ error: err.message });
     }
-
-    return reply.status(200).send({
-      metrics: {
-        total_active_markets: allFormatted.length,
-        polymarket_active_count: polymarketCount,
-        // 24h deltas need historical snapshots — never invent percentages.
-        polymarket_trend: null,
-        polymarket_change_24h: null,
-        kalshi_active_count: kalshiCount,
-        kalshi_trend: null,
-        kalshi_change_24h: null,
-        total_volume_usd: Math.round(totalVolume),
-        volume_trend: null,
-        volume_change_24h: null,
-        last_updated: new Date().toISOString(),
-      },
-      movers: [...allFormatted].sort((a, b) => b.volume - a.volume).slice(0, 5),
-      ending_soon: [...allFormatted].filter((m) => m.end_date && new Date(m.end_date).getTime() > now).sort((a, b) => new Date(a.end_date!).getTime() - new Date(b.end_date!).getTime()).slice(0, 5),
-    });
   });
 
   // 5. GET /api/v1/markets
+  // Card fields only. Selecting raw_data and sorting it makes the database
+  // cancel the statement, which returned 500 for this list.
   fastify.get('/api/v1/markets', async (request, reply) => {
     const query = request.query as Record<string, any>;
     const platform = resolvePlatformParam(query);
-    const category = query.category;
-    const limit = parseInt(query.limit || '20', 10);
-    const offset = parseInt(query.offset || '0', 10);
+    const category = typeof query.category === 'string' ? query.category.trim() : '';
+    const limit = Math.min(Math.max(parseInt(query.limit || '20', 10) || 20, 1), 100);
+    const offset = Math.max(parseInt(query.offset || '0', 10) || 0, 0);
+    const filtered = () => {
+      let dbQuery = supabaseAdmin.from('markets').select(MARKET_CARD_COLUMNS).eq('active', true);
+      if (platform) dbQuery = dbQuery.eq('platform', platform);
+      if (category) dbQuery = dbQuery.ilike('category', `%${category}%`);
+      return dbQuery;
+    };
 
-    let dbQuery = supabaseAdmin
-      .from('markets')
-      .select('canonical_id, platform, external_id, title, category, outcomes, prices, volume, active, raw_data, ai_summary, ai_sentiment_label, ai_last_updated, updated_at')
-      .eq('active', true)
-      .order('updated_at', { ascending: false });
-
-    if (platform) dbQuery = dbQuery.eq('platform', platform);
-    if (category) dbQuery = dbQuery.ilike('category', `%${category.trim()}%`);
-
-    const { data, error } = await dbQuery.range(offset, offset + limit - 1);
+    // A full-table volume sort takes long enough that this request 500s.
+    // Take the page, then sort that page.
+    const { data, error } = await filtered().range(offset, offset + limit - 1);
     if (error) return reply.status(500).send({ error: error.message });
 
-    const enriched = await withKalshiEventVolumes(data ?? []);
-    return reply.status(200).send({ markets: enriched.map(formatMarket) });
+    const markets = (data ?? []).map(formatCardRow);
+    markets.sort((a, b) => (b.volume || 0) - (a.volume || 0));
+    return reply.status(200).send({ markets });
   });
 
   // 6. GET /api/v1/markets/:id
@@ -410,8 +446,10 @@ export async function marketRoutes(fastify: FastifyInstance) {
 
     if (error || !data) return reply.status(404).send({ error: 'Market not found' });
 
-    const [enriched] = await withKalshiEventVolumes([data]);
-    return reply.status(200).send({ market: formatMarket(enriched) });
+    // Event volume is already on the row from sync. A live sibling scan
+    // selects raw_data and the database cancels it, which left this page
+    // on "Loading..." until the statement timed out.
+    return reply.status(200).send({ market: formatMarket(data) });
   });
 
   // 7. GET /api/v1/markets/:id/orderbook
@@ -428,10 +466,21 @@ export async function marketRoutes(fastify: FastifyInstance) {
   // 8. GET /api/v1/markets/:id/candles?resolution=5m|15m|1h|4h|1d|1w
   // Unknown market → 404 (same as GET /markets/:id). Known market with no
   // history → 200 + { candles: [] }.
+  // from+to → stored bars in that window only (no forming candle, no newest-N trim).
+  // The chart uses that for finer blocks inside the open bucket.
   fastify.get('/api/v1/markets/:id/candles', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const query = request.query as { resolution?: string };
+    const query = request.query as {
+      resolution?: string;
+      from?: string;
+      to?: string;
+      outcome?: string;
+    };
     const resolutionParam = query.resolution ?? '1h';
+    const outcomeIndex = parseOutcomeIndex(query.outcome);
+    if (outcomeIndex == null) {
+      return reply.status(400).send({ error: 'outcome must be a whole number from 0 to 1024' });
+    }
 
     if (!isCandleResolution(resolutionParam)) {
       return reply.status(400).send({
@@ -449,8 +498,38 @@ export async function marketRoutes(fastify: FastifyInstance) {
       return reply.status(404).send({ error: 'Market not found' });
     }
 
+    const hasFrom = query.from != null && query.from !== '';
+    const hasTo = query.to != null && query.to !== '';
+    if (hasFrom !== hasTo) {
+      return reply.status(400).send({ error: 'from and to must be sent together' });
+    }
+
     try {
-      const candles = await candleAggregator.getCandles(id, resolutionParam as CandleResolution);
+      if (hasFrom && hasTo) {
+        const fromMs = Date.parse(String(query.from));
+        const toMs = Date.parse(String(query.to));
+        if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs < fromMs) {
+          return reply.status(400).send({ error: 'from and to must be valid timestamps' });
+        }
+        const maxWindowMs = 14 * 24 * 60 * 60 * 1000;
+        if (toMs - fromMs > maxWindowMs) {
+          return reply.status(400).send({ error: 'from/to window cannot exceed 14 days' });
+        }
+        const candles = await candleAggregator.getCandlesSince(
+          id,
+          resolutionParam as CandleResolution,
+          fromMs,
+          toMs,
+          outcomeIndex
+        );
+        return reply.status(200).send({ candles });
+      }
+
+      const candles = await candleAggregator.getCandles(
+        id,
+        resolutionParam as CandleResolution,
+        outcomeIndex
+      );
       // Honest empty history: known market with no bars → 200 + []. Never invent OHLCV.
       return reply.status(200).send({ candles });
     } catch (err: any) {

@@ -227,8 +227,9 @@ function pointsToCandles(
 ): Candle[] {
   const bucketSec = RESOLUTION_SECONDS[resolution];
   const buckets = new Map<number, { prices: number[]; count: number }>();
+  const ordered = [...points].sort((a, b) => Number(a.t) - Number(b.t));
 
-  for (const point of points) {
+  for (const point of ordered) {
     if (point?.t == null || point?.p == null) continue;
     const price = Number(point.p);
     if (!Number.isFinite(price)) continue;
@@ -332,6 +333,27 @@ function mapRpcRows(
     ),
     resolution
   );
+}
+
+/** CLOB token ids in outcome order. Index 0 stays the primary series. */
+function polyTokenIds(raw: any): string[] {
+  const value = raw?.clobTokenIds ?? raw?.clob_token_ids;
+  if (Array.isArray(value)) return value.map((id) => String(id)).filter(Boolean);
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.map((id) => String(id)).filter(Boolean);
+    } catch {
+      return value ? [value] : [];
+    }
+  }
+  if (Array.isArray(raw?.tokens)) {
+    return raw.tokens
+      .map((token: any) => token?.token_id ?? token?.clobTokenId ?? token?.id)
+      .filter(Boolean)
+      .map(String);
+  }
+  return [];
 }
 
 function getPrimaryPolyToken(raw: any): string | null {
@@ -519,8 +541,12 @@ class CandleAggregator {
    */
   async getCandles(
     canonicalId: string,
-    resolution: CandleResolution = '1h'
+    resolution: CandleResolution = '1h',
+    outcomeIndex = 0
   ): Promise<Candle[]> {
+    if (outcomeIndex > 0) {
+      return this.getOutcomeCandles(canonicalId, resolution, outcomeIndex);
+    }
     if (!isCandleResolution(resolution)) {
       throw new Error(
         `Unsupported resolution "${resolution}". Allowed: ${CANDLE_RESOLUTIONS.join(', ')}`
@@ -577,8 +603,12 @@ class CandleAggregator {
     canonicalId: string,
     resolution: CandleResolution,
     fromMs: number,
-    toMs = Date.now()
+    toMs = Date.now(),
+    outcomeIndex = 0
   ): Promise<Candle[]> {
+    if (outcomeIndex > 0) {
+      return this.getOutcomeCandlesSince(canonicalId, resolution, fromMs, toMs, outcomeIndex);
+    }
     if (!isCandleResolution(resolution)) {
       throw new Error(
         `Unsupported resolution "${resolution}". Allowed: ${CANDLE_RESOLUTIONS.join(', ')}`
@@ -601,34 +631,141 @@ class CandleAggregator {
       ticker = getPrimaryPolyToken(market.raw_data ?? {});
     }
 
+    const inWindow = (rows: Candle[]) =>
+      rows
+        .filter((c) => {
+          const t = new Date(c.bucket).getTime();
+          return Number.isFinite(t) && t >= fromMs && t <= toMs;
+        })
+        .sort((a, b) => new Date(a.bucket).getTime() - new Date(b.bucket).getTime());
+
+    // Price history is indexed by ticker. Start it with the RPC so a slow
+    // aggregation does not add another round trip before we can answer.
+    const historyPromise = this.fromPriceHistory(market, resolution).catch(() => [] as Candle[]);
+
+    let rpcTimedOut = false;
     if (ticker) {
       try {
-        const { data, error } = await supabaseAdmin.rpc('get_candles', {
+        const rpc = supabaseAdmin.rpc('get_candles', {
           p_platform: platform,
           p_ticker: ticker,
           p_bucket_seconds: RESOLUTION_SECONDS[resolution],
           p_from: new Date(fromMs).toISOString(),
           p_to: new Date(toMs).toISOString(),
         });
+        const { data, error } = await Promise.race([
+          rpc,
+          new Promise<{ data: null; error: { message: string } }>((resolve) => {
+            setTimeout(
+              () => resolve({ data: null, error: { message: 'get_candles timed out' } }),
+              4_000
+            );
+          }),
+        ]);
         if (!error && Array.isArray(data) && data.length > 0) {
           // Do not apply chart MAX_CANDLES limit — ratios need full window.
           return mapRpcRows(data, market.canonical_id).sort(
             (a, b) => new Date(a.bucket).getTime() - new Date(b.bucket).getTime()
           );
         }
+        rpcTimedOut = error?.message === 'get_candles timed out';
       } catch (err: any) {
         console.warn(`[CandleAggregator] getCandlesSince RPC: ${err?.message ?? err}`);
       }
     }
 
-    // Fallback: chart path (may be truncated to MAX_CANDLES)
-    const fallback = await this.getCandles(canonicalId, resolution);
-    return fallback
-      .filter((c) => {
-        const t = new Date(c.bucket).getTime();
+    const fromHistory = inWindow(await historyPromise);
+    if (fromHistory.length) return fromHistory;
+
+    // The venue call is the same fallback the chart uses. Skip it when the
+    // database call already failed to answer: that second timeout was stacking
+    // another ~4s onto ratios and still returned no bars.
+    if (rpcTimedOut) return [];
+
+    let fromApi: Candle[] = [];
+    if (market.platform === 'polymarket') {
+      fromApi = await this.fromPolymarketApi(market, resolution);
+    } else if (market.platform === 'kalshi') {
+      fromApi = await this.fromKalshiApi(market, resolution);
+    }
+    return inWindow(fromApi);
+  }
+
+  /**
+   * History for a non-primary outcome. Stored series and the live forming
+   * candle belong to token 0, so this reads that outcome's own CLOB token
+   * and does not attach the primary forming bar.
+   * Outcome 0 never enters here.
+   */
+  private async getOutcomeCandles(
+    canonicalId: string,
+    resolution: CandleResolution,
+    outcomeIndex: number
+  ): Promise<Candle[]> {
+    if (!isCandleResolution(resolution)) {
+      throw new Error(
+        `Unsupported resolution "${resolution}". Allowed: ${CANDLE_RESOLUTIONS.join(', ')}`
+      );
+    }
+    const scoped = await this.marketScopedToOutcome(canonicalId, outcomeIndex);
+    if (!scoped) return [];
+
+    const fromHistory = await this.fromPriceHistory(scoped, resolution);
+    if (fromHistory.length) return limitCandles(fromHistory, resolution);
+
+    const fromApi = await this.fromPolymarketApi(scoped, resolution);
+    return limitCandles(fromApi, resolution);
+  }
+
+  /** Stored bars only for a non-primary outcome. No venue call on the 15s finer loop. */
+  private async getOutcomeCandlesSince(
+    canonicalId: string,
+    resolution: CandleResolution,
+    fromMs: number,
+    toMs: number,
+    outcomeIndex: number
+  ): Promise<Candle[]> {
+    if (!isCandleResolution(resolution)) {
+      throw new Error(
+        `Unsupported resolution "${resolution}". Allowed: ${CANDLE_RESOLUTIONS.join(', ')}`
+      );
+    }
+    const scoped = await this.marketScopedToOutcome(canonicalId, outcomeIndex);
+    if (!scoped) return [];
+
+    const rows = await this.fromPriceHistory(scoped, resolution);
+    return rows
+      .filter((candle) => {
+        const t = new Date(candle.bucket).getTime();
         return Number.isFinite(t) && t >= fromMs && t <= toMs;
       })
       .sort((a, b) => new Date(a.bucket).getTime() - new Date(b.bucket).getTime());
+  }
+
+  /**
+   * Copy the market with clobTokenIds set to one outcome token so the existing
+   * primary-token readers stay unchanged.
+   */
+  private async marketScopedToOutcome(
+    canonicalId: string,
+    outcomeIndex: number
+  ): Promise<{ canonical_id: string; platform: string; external_id: string | null; raw_data: any } | null> {
+    const { data: market } = await supabaseAdmin
+      .from('markets')
+      .select('canonical_id, platform, external_id, raw_data')
+      .eq('canonical_id', canonicalId)
+      .maybeSingle();
+    if (!market || market.platform !== 'polymarket') return null;
+
+    const tokenId = polyTokenIds(market.raw_data ?? {})[outcomeIndex];
+    if (!tokenId) return null;
+
+    return {
+      canonical_id: market.canonical_id,
+      platform: market.platform,
+      external_id: market.external_id ? String(market.external_id) : null,
+      raw_data: { ...(market.raw_data ?? {}), clobTokenIds: [tokenId] },
+    };
   }
 
   /**
@@ -829,7 +966,7 @@ class CandleAggregator {
     try {
       const { count, error: countError } = await supabaseAdmin
         .from('markets')
-        .select('canonical_id', { count: 'exact', head: true })
+        .select('canonical_id', { count: 'estimated', head: true })
         .eq('active', true);
 
       if (countError) {
@@ -941,15 +1078,17 @@ class CandleAggregator {
   private async loadHighVolumeActiveMarkets(limit: number): Promise<SyncMarketRow[]> {
     const { data, error } = await supabaseAdmin
       .from('markets')
-      .select('canonical_id, platform, external_id, raw_data, volume, active')
+      .select('canonical_id, platform, external_id, volume, active')
       .eq('active', true)
-      .order('volume', { ascending: false })
+      .order('canonical_id', { ascending: true })
       .limit(limit);
     if (error) {
       console.warn(`[CandleAggregator] volume markets: ${error.message.slice(0, 200)}`);
       return [];
     }
-    return (data ?? []) as SyncMarketRow[];
+    return [...(data ?? [])].sort(
+      (a, b) => Number(b.volume || 0) - Number(a.volume || 0)
+    ) as SyncMarketRow[];
   }
 
   private async loadActiveMarketsByRanges(
@@ -960,7 +1099,7 @@ class CandleAggregator {
       if (range.to < range.from) continue;
       const { data, error } = await supabaseAdmin
         .from('markets')
-        .select('canonical_id, platform, external_id, raw_data, volume, active')
+        .select('canonical_id, platform, external_id, volume, active')
         .eq('active', true)
         .order('canonical_id', { ascending: true })
         .range(range.from, range.to);
@@ -1741,7 +1880,10 @@ class CandleAggregator {
     ];
 
     for (const url of attempts) {
-      const res = await fetch(url, { headers: { Accept: 'application/json' } });
+      const res = await fetch(url, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(4_000),
+      });
       if (!res.ok) continue;
         const data = await res.json();
       const page = data.history || [];

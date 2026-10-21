@@ -631,22 +631,67 @@ async function loadPersistedMatch(
   return { ...validated, fromCache: true };
 }
 
-const MARKET_SELECT =
-  'canonical_id, platform, external_id, title, outcomes, prices, raw_data, active, volume';
+/**
+ * Matching only reads a few raw_data keys. Selecting the whole JSON blob
+ * made ORDER BY volume on the catalogue get cancelled (ratios sat ~80s).
+ */
+const CANDIDATE_SELECT = [
+  'canonical_id',
+  'platform',
+  'external_id',
+  'title',
+  'outcomes',
+  'prices',
+  'active',
+  'volume',
+  'yes_sub_title:raw_data->yes_sub_title',
+  'group_item_title:raw_data->groupItemTitle',
+  'close_time:raw_data->close_time',
+  'expiration_time:raw_data->expiration_time',
+  'end_date:raw_data->end_date',
+  'end_date_camel:raw_data->endDate',
+  'end_date_iso:raw_data->endDateIso',
+].join(', ');
 
-async function loadCandidatePool(
+const CANDIDATE_CACHE_MS = 30_000;
+/** Ratios must not sit on a catalogue sort. The query keeps running and fills this cache. */
+const RATIO_CANDIDATE_WAIT_MS = 1_500;
+const candidateCache = new Map<string, { at: number; rows: MatchCandidateMarket[] }>();
+const candidateInflight = new Map<string, Promise<MatchCandidateMarket[]>>();
+
+function candidateFromRow(row: Record<string, unknown>): MatchCandidateMarket {
+  return {
+    canonical_id: String(row.canonical_id ?? ''),
+    platform: String(row.platform ?? ''),
+    external_id: String(row.external_id ?? ''),
+    title: row.title != null ? String(row.title) : null,
+    outcomes: row.outcomes,
+    prices: row.prices as number[] | null | undefined,
+    active: row.active as boolean | null | undefined,
+    volume: row.volume as number | null | undefined,
+    raw_data: {
+      yes_sub_title: row.yes_sub_title ?? null,
+      groupItemTitle: row.group_item_title ?? null,
+      close_time: row.close_time ?? null,
+      expiration_time: row.expiration_time ?? null,
+      end_date: row.end_date ?? null,
+      endDate: row.end_date_camel ?? null,
+      endDateIso: row.end_date_iso ?? null,
+    },
+  };
+}
+
+async function queryCandidatePool(
   platform: 'polymarket' | 'kalshi',
-  limit = MATCH_CANDIDATE_LIMIT,
-  offset = 0
+  safeLimit: number,
+  safeOffset: number,
+  cacheKey: string
 ): Promise<MatchCandidateMarket[]> {
-  const safeLimit = Math.max(1, Math.floor(limit));
-  const safeOffset = Math.max(0, Math.floor(offset));
   const from = safeOffset;
   const to = safeOffset + safeLimit - 1;
-
   const { data, error } = await supabaseAdmin
     .from('markets')
-    .select(MARKET_SELECT)
+    .select(CANDIDATE_SELECT)
     .eq('platform', platform)
     .eq('active', true)
     .order('volume', { ascending: false })
@@ -656,7 +701,40 @@ async function loadCandidatePool(
     console.warn(`[marketMatching] candidate load ${platform}:`, error.message);
     return [];
   }
-  return dedupeCandidates((data ?? []) as MatchCandidateMarket[]);
+  const rows = dedupeCandidates(
+    (data ?? []).map((row) => candidateFromRow(row as Record<string, unknown>))
+  );
+  candidateCache.set(cacheKey, { at: Date.now(), rows });
+  return rows;
+}
+
+async function loadCandidatePool(
+  platform: 'polymarket' | 'kalshi',
+  limit = MATCH_CANDIDATE_LIMIT,
+  offset = 0,
+  waitMs?: number
+): Promise<MatchCandidateMarket[]> {
+  const safeLimit = Math.max(1, Math.floor(limit));
+  const safeOffset = Math.max(0, Math.floor(offset));
+  const cacheKey = `${platform}:${safeLimit}:${safeOffset}`;
+  const cached = candidateCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < CANDIDATE_CACHE_MS) return cached.rows;
+
+  let job = candidateInflight.get(cacheKey);
+  if (!job) {
+    job = queryCandidatePool(platform, safeLimit, safeOffset, cacheKey).finally(() => {
+      candidateInflight.delete(cacheKey);
+    });
+    candidateInflight.set(cacheKey, job);
+  }
+
+  if (waitMs == null) return job;
+  return Promise.race([
+    job,
+    new Promise<MatchCandidateMarket[]>((resolve) => {
+      setTimeout(() => resolve([]), waitMs);
+    }),
+  ]);
 }
 
 /** Bound DB rows scanned while collecting matchable sync sources. */
@@ -731,7 +809,12 @@ async function scanForTwin(
   sourceProb?: number | null
 ): Promise<CrossPlatformMatch | null> {
   const otherPlatform = source.platform === 'polymarket' ? 'kalshi' : 'polymarket';
-  const candidates = await loadCandidatePool(otherPlatform, MATCH_CANDIDATE_LIMIT);
+  const candidates = await loadCandidatePool(
+    otherPlatform,
+    MATCH_CANDIDATE_LIMIT,
+    0,
+    RATIO_CANDIDATE_WAIT_MS
+  );
   return findBestTwin(source, candidates, sourceProb);
 }
 
