@@ -29,6 +29,7 @@ import {
   scoreTwinAgainstSource,
   type MatchCandidateMarket,
 } from '../services/marketMatching.js';
+import { rememberLiveQuote } from '../lib/liveQuotes.js';
 import {
   assembleAlignedTwinProb,
   assembleCurrentProb,
@@ -255,6 +256,12 @@ function runInputAssembly() {
 
   // no book → stored last
   assert.equal(assembleCurrentProb(0.61, null, null), 0.61);
+
+  // live socket YES wins over a placeholder wide book and over a tight book mid
+  assert.equal(assembleCurrentProb(0.42, 0.1, 0.9, 0.73), 0.73);
+  assert.equal(assembleCurrentProb(0.4, 0.55, 0.57, 0.8), 0.8);
+  // invalid live quote is ignored; wide book still falls back to last trade
+  assert.equal(assembleCurrentProb(0.42, 0.1, 0.9, 1.5), 0.42);
 
   // pickReliableProb priority
   assert.equal(pickReliableProb({ mid: 0.5, last_price: 0.4, bid: 0.49, ask: 0.51 }), 0.5);
@@ -561,6 +568,27 @@ async function runEngineWithMocks() {
   });
   assert.equal(twinNoBook.inputs.kalshiProb, 0.58);
   assert.ok(twinNoBook.ratios.divergence != null);
+
+  // Wide placeholder book (0.01/0.99) must not become 0.50 when a live YES quote exists.
+  const liveMarket: RatioMarketRow = { ...market, canonical_id: 'polymarket_live_quote' };
+  rememberLiveQuote(liveMarket.canonical_id, [0.395, 0.605]);
+  try {
+    const liveWide = await computeMarketRatios(liveMarket, {
+      fetchProviderStats: async () => ({
+        volume_24h: 1000,
+        liquidity: 500,
+        open_interest: 2000,
+        updated_at: new Date().toISOString(),
+      }),
+      fetchBestBidAsk: async () => ({ bid: 0.01, ask: 0.99, kalshiOrderbook: null }),
+      getCandlesSince: async () => candleRows,
+      resolveCrossPlatformMatch: async () => null,
+    });
+    assert.equal(liveWide.inputs.currentProb, 0.395);
+    assert.equal(liveWide.inputs.polyProb, 0.395);
+  } finally {
+    rememberLiveQuote(liveMarket.canonical_id, []);
+  }
 }
 
 function runMatching() {

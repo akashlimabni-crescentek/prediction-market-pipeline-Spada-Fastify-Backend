@@ -22,6 +22,7 @@ import {
   extractPolymarketStats,
   type ProviderMarketStats,
 } from '../lib/providerStats.js';
+import { readLiveQuote } from '../lib/liveQuotes.js';
 import { orderbookStore } from './orderbookStore.js';
 import { candleAggregator } from './candleAggregator.js';
 import {
@@ -103,16 +104,26 @@ export function assembleVol24h(
   return vol24h;
 }
 
+function validLiveYes(price: number | null | undefined): number | null {
+  if (price == null || !Number.isFinite(price) || price < 0 || price > 1) return null;
+  return price;
+}
+
 /**
- * POC pickReliableProb over Spada orderbook + stored YES price.
- * mid = (bid+ask)/2 when both sides present; last_price = markets.prices[0].
- * Same input shape for source currentProb and twin (divergence) probability.
+ * Current probability for momentum and divergence.
+ * A live socket YES price wins: it is the venue midpoint the chart is showing.
+ * With no live quote, pickReliableProb rejects a placeholder wide book
+ * (spread > 0.5, mid 0.50) and uses the stored last trade.
  */
 export function assembleCurrentProb(
   storedYesPrice: number | null | undefined,
   bestBid: number | null,
-  bestAsk: number | null
+  bestAsk: number | null,
+  liveYes?: number | null
 ): number | null {
+  const live = validLiveYes(liveYes);
+  if (live != null) return live;
+
   const mid =
     bestBid != null && bestAsk != null ? (bestBid + bestAsk) / 2 : null;
   return pickReliableProb({
@@ -131,9 +142,11 @@ export function assembleAlignedTwinProb(
   twin: MatchCandidateMarket,
   twinBid: number | null,
   twinAsk: number | null,
-  sourceProb?: number | null
+  sourceProb?: number | null,
+  liveYes?: number | null
 ): number | null {
-  const raw = marketReliableProb(twin, { bid: twinBid, ask: twinAsk });
+  const live = validLiveYes(liveYes);
+  const raw = live ?? marketReliableProb(twin, { bid: twinBid, ask: twinAsk });
   if (raw == null) return null;
   return alignTwinReliableProb(source, twin, raw, sourceProb);
 }
@@ -228,6 +241,30 @@ export async function fetchBestBidAsk(market: RatioMarketRow): Promise<{
   return { bid: null, ask: null, kalshiOrderbook: null };
 }
 
+const RATIO_HEAVY_TTL_MS = 5_000;
+
+type RatioBook = {
+  bid: number | null;
+  ask: number | null;
+  kalshiOrderbook: Record<string, unknown> | null;
+};
+
+type RatioCandleRow = { ts: string; close: number; volume: number };
+
+type RatioHeavySnapshot = {
+  at: number;
+  stats: ProviderMarketStats | null;
+  book: RatioBook;
+  candleRows: RatioCandleRow[];
+  twin: {
+    match: CrossPlatformMatch;
+    bid: number | null;
+    ask: number | null;
+  } | null;
+};
+
+const ratioHeavyCache = new Map<string, RatioHeavySnapshot>();
+
 export type RatioEngineDeps = {
   fetchProviderStats?: (m: RatioMarketRow) => Promise<ProviderMarketStats | null>;
   fetchBestBidAsk?: (m: RatioMarketRow) => Promise<{
@@ -262,43 +299,89 @@ export async function computeMarketRatios(
   const now = Date.now();
   const from7d = now - 7 * 24 * 60 * 60 * 1000;
   const daysToClose = daysUntilClose(closeTimeOf(market), now);
+  const usingDefaultDeps =
+    deps.fetchProviderStats == null &&
+    deps.fetchBestBidAsk == null &&
+    deps.getCandlesSince == null &&
+    deps.resolveCrossPlatformMatch == null;
 
-  // Stats + book + candles first; match after currentProb is known (and can hit cache).
-  const [stats, book, candles5m] = await Promise.all([
-    fetchStats(market),
-    fetchBook(market),
-    getCandles(market.canonical_id, '5m', from7d, now),
-  ]);
+  let stats: ProviderMarketStats | null;
+  let book: RatioBook;
+  let candleRows: RatioCandleRow[];
+  let twinSnap: RatioHeavySnapshot['twin'] = null;
 
-  const candleRows = candles5m.map((c) => ({
-    ts: c.bucket,
-    close: c.close,
-    volume: c.volume,
-  }));
+  const cached = usingDefaultDeps
+    ? ratioHeavyCache.get(market.canonical_id)
+    : undefined;
+  if (cached && now - cached.at < RATIO_HEAVY_TTL_MS) {
+    stats = cached.stats;
+    book = cached.book;
+    candleRows = cached.candleRows;
+    twinSnap = cached.twin;
+  } else {
+    // Stats + book + candles first; match after currentProb is known (and can hit cache).
+    const [fetchedStats, fetchedBook, candles5m] = await Promise.all([
+      fetchStats(market),
+      fetchBook(market),
+      getCandles(market.canonical_id, '5m', from7d, now),
+    ]);
+    stats = fetchedStats;
+    book = fetchedBook;
+    candleRows = candles5m.map((c) => ({
+      ts: c.bucket,
+      close: c.close,
+      volume: c.volume,
+    }));
+
+    const seedProb = assembleCurrentProb(
+      storedYesPrice(market),
+      book.bid,
+      book.ask,
+      readLiveQuote(market.canonical_id)?.[0]
+    );
+    const crossMatch = await resolveMatch(market, seedProb);
+    if (crossMatch) {
+      const twinBook = await fetchBook(crossMatch.twin as RatioMarketRow);
+      twinSnap = {
+        match: crossMatch,
+        bid: twinBook.bid,
+        ask: twinBook.ask,
+      };
+    }
+
+    if (usingDefaultDeps) {
+      ratioHeavyCache.set(market.canonical_id, {
+        at: now,
+        stats,
+        book,
+        candleRows,
+        twin: twinSnap,
+      });
+    }
+  }
 
   const bestBid = book.bid;
   const bestAsk = book.ask;
   const resolvedCurrentProb = assembleCurrentProb(
     storedYesPrice(market),
     bestBid,
-    bestAsk
+    bestAsk,
+    readLiveQuote(market.canonical_id)?.[0]
   );
 
-  let crossMatch: CrossPlatformMatch | null = await resolveMatch(
-    market,
-    resolvedCurrentProb
-  );
+  let crossMatch: CrossPlatformMatch | null = twinSnap
+    ? { ...twinSnap.match }
+    : null;
 
-  // Twin divergence prob: POC pickReliableProb(mid, last, bid, ask) + alignTwinPrice.
-  // Matching may have used stored price only; enrich once with twin orderbook.
-  if (crossMatch) {
-    const twinBook = await fetchBook(crossMatch.twin as RatioMarketRow);
+  // Twin divergence prob: live quote when present, else pickReliableProb, then alignTwinPrice.
+  if (crossMatch && twinSnap) {
     const aligned = assembleAlignedTwinProb(
       market,
       crossMatch.twin,
-      twinBook.bid,
-      twinBook.ask,
-      resolvedCurrentProb
+      twinSnap.bid,
+      twinSnap.ask,
+      resolvedCurrentProb,
+      readLiveQuote(crossMatch.twin.canonical_id)?.[0]
     );
     if (aligned != null) {
       crossMatch = { ...crossMatch, alignedTwinProb: aligned };
