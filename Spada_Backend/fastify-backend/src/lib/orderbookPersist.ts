@@ -89,6 +89,35 @@ export function extractPolymarketTokenIds(raw: Record<string, unknown> | null | 
   };
 }
 
+export function polymarketConditionId(
+  canonicalId: string,
+  raw: Record<string, unknown> | null | undefined
+): string | null {
+  const fromRaw = raw?.conditionId ?? raw?.condition_id;
+  if (typeof fromRaw === 'string' && fromRaw.startsWith('0x')) return fromRaw;
+  if (canonicalId.startsWith('polymarket_')) {
+    const rest = canonicalId.slice('polymarket_'.length);
+    if (rest.startsWith('0x')) return rest;
+  }
+  return null;
+}
+
+/** CLOB 404 body when a listed token no longer has a book. */
+export function isPolymarketMissingBook(status: number, body: unknown): boolean {
+  if (status !== 404 || !body || typeof body !== 'object') return false;
+  const message = String((body as { error?: unknown }).error ?? '').toLowerCase();
+  return message.includes('no orderbook exists');
+}
+
+/** Closed or explicitly disabled books are an empty ladder, not a substitute book. */
+export function polymarketBookDisabled(meta: {
+  closed?: unknown;
+  enable_order_book?: unknown;
+} | null | undefined): boolean {
+  if (!meta) return false;
+  return meta.closed === true || meta.enable_order_book === false;
+}
+
 /**
  * Persist Polymarket CLOB YES-token book as yes/no bid ladders
  * (same storage convention as Kalshi): YES asks ⇒ NO bids via 1−price.

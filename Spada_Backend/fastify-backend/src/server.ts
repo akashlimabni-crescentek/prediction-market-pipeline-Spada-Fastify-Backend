@@ -45,10 +45,12 @@ function scheduleBackgroundWorkers() {
   }
 
   // 2. Market catalog sync (runs immediately on boot, then every 1 hour)
+  server.log.info('[Workers] Triggering initial market catalog sync on boot...');
   runMarketSync().catch((err) =>
     server.log.error(`[Workers] Market sync error: ${err.message}`)
   );
   setInterval(() => {
+    server.log.info('[Workers] 1-hour interval timer fired: executing market catalog sync...');
     runMarketSync().catch((err) =>
       server.log.error(`[Workers] Market sync interval error: ${err.message}`)
     );

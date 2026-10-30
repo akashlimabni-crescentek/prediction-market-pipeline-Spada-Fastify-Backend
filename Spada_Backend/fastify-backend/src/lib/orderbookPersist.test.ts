@@ -8,7 +8,10 @@ import {
   buildKalshiOrderbookRow,
   buildPolymarketOrderbookRow,
   extractPolymarketTokenIds,
+  isPolymarketMissingBook,
   LatestWinsPersistQueue,
+  polymarketBookDisabled,
+  polymarketConditionId,
   orderbookLadderFingerprint,
   polyClobBookToYesNoBids,
   resolvePolymarketOrderbookMarketId,
@@ -296,8 +299,25 @@ async function runQueuePlusWriteLatestWins() {
   console.log('✓ queue + writeLatestSnapshot (normal latest-wins)');
 }
 
+function runClosedBookDetection() {
+  const id = 'polymarket_0xabc';
+  assert.equal(polymarketConditionId(id, { conditionId: '0xabc' }), '0xabc');
+  assert.equal(polymarketConditionId(id, {}), '0xabc');
+  assert.equal(polymarketConditionId('kalshi_TICKER', {}), null);
+  assert.equal(
+    isPolymarketMissingBook(404, { error: 'No orderbook exists for the requested token id' }),
+    true
+  );
+  assert.equal(isPolymarketMissingBook(500, { error: 'No orderbook exists' }), false);
+  assert.equal(isPolymarketMissingBook(404, { error: 'something else' }), false);
+  assert.equal(polymarketBookDisabled({ closed: true, enable_order_book: false }), true);
+  assert.equal(polymarketBookDisabled({ closed: false, enable_order_book: true }), false);
+  console.log('✓ closed Polymarket book detection');
+}
+
 async function run() {
   runResolvePolymarketMarketId();
+  runClosedBookDetection();
   runExtractTokens();
   runPolyClobToYesNo();
   runBuildPolymarketRow();

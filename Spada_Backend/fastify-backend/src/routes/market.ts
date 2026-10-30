@@ -9,7 +9,6 @@ import {
   type CandleResolution,
 } from '../services/candleAggregator.js';
 
-/** Chart outcome index. Missing means the primary series (unchanged). */
 function parseOutcomeIndex(raw: string | undefined): number | null {
   if (raw == null || raw === '') return 0;
   if (!/^\d+$/.test(raw)) return null;
@@ -475,16 +474,24 @@ export async function marketRoutes(fastify: FastifyInstance) {
       from?: string;
       to?: string;
       outcome?: string;
+      stored?: string;
     };
     const resolutionParam = query.resolution ?? '1h';
     const outcomeIndex = parseOutcomeIndex(query.outcome);
+    // 1m is stored line history only. Every other resolution is stored history too.
+    const storedOnly = query.stored === '1';
     if (outcomeIndex == null) {
       return reply.status(400).send({ error: 'outcome must be a whole number from 0 to 1024' });
     }
 
-    if (!isCandleResolution(resolutionParam)) {
+    if (resolutionParam !== '1m' && !isCandleResolution(resolutionParam)) {
       return reply.status(400).send({
         error: `Unsupported resolution "${resolutionParam}". Allowed: ${CANDLE_RESOLUTIONS.join(', ')}`,
+      });
+    }
+    if (resolutionParam === '1m' && !storedOnly) {
+      return reply.status(400).send({
+        error: 'resolution 1m is only available for stored line history',
       });
     }
 
@@ -511,9 +518,14 @@ export async function marketRoutes(fastify: FastifyInstance) {
         if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs < fromMs) {
           return reply.status(400).send({ error: 'from and to must be valid timestamps' });
         }
-        const maxWindowMs = 14 * 24 * 60 * 60 * 1000;
+        // POC OHLCV 1d/1w look back 365 days. The line chart ALL range stays 90 days.
+        const maxWindowMs = 365 * 24 * 60 * 60 * 1000;
         if (toMs - fromMs > maxWindowMs) {
-          return reply.status(400).send({ error: 'from/to window cannot exceed 14 days' });
+          return reply.status(400).send({ error: 'from/to window cannot exceed 365 days' });
+        }
+        if (resolutionParam === '1m') {
+          const candles = await candleAggregator.getOneMinuteCandles(id, fromMs, toMs, outcomeIndex);
+          return reply.status(200).send({ candles });
         }
         const candles = await candleAggregator.getCandlesSince(
           id,
@@ -525,12 +537,15 @@ export async function marketRoutes(fastify: FastifyInstance) {
         return reply.status(200).send({ candles });
       }
 
+      if (resolutionParam === '1m') {
+        return reply.status(400).send({ error: 'from and to are required for resolution 1m' });
+      }
+
       const candles = await candleAggregator.getCandles(
         id,
         resolutionParam as CandleResolution,
         outcomeIndex
       );
-      // Honest empty history: known market with no bars → 200 + []. Never invent OHLCV.
       return reply.status(200).send({ candles });
     } catch (err: any) {
       return reply.status(500).send({ error: err.message });

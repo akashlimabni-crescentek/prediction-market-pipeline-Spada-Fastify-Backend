@@ -692,6 +692,98 @@ class CandleAggregator {
   }
 
   /**
+   * Stored 1-minute bars for the line chart (POC 1H and 6H).
+   * This is not an OHLCV resolution. It reads the 1m OHLC tables only.
+   */
+  async getOneMinuteCandles(
+    canonicalId: string,
+    fromMs: number,
+    toMs: number,
+    outcomeIndex = 0
+  ): Promise<Candle[]> {
+    const { data: market } = await supabaseAdmin
+      .from('markets')
+      .select('canonical_id, platform, external_id, raw_data')
+      .eq('canonical_id', canonicalId)
+      .maybeSingle();
+    if (!market) return [];
+
+    const scoped =
+      outcomeIndex > 0 ? await this.marketScopedToOutcome(canonicalId, outcomeIndex) : market;
+    if (!scoped) return [];
+    if (scoped.platform !== 'polymarket' && scoped.platform !== 'kalshi') return [];
+
+    const ticker = this.resolveOhlcTicker(scoped);
+    if (!ticker) return [];
+
+    const fromIso = new Date(fromMs).toISOString();
+    const toIso = new Date(toMs).toISOString();
+
+    try {
+      if (scoped.platform === 'polymarket') {
+        const { data, error } = await supabaseAdmin
+          .from('polymarket_ohlc')
+          .select('ts, open, high, low, close, volume')
+          .eq('token_id', ticker)
+          .eq('interval', BASE_OHLC_INTERVAL)
+          .gte('ts', fromIso)
+          .lte('ts', toIso)
+          .order('ts', { ascending: true })
+          .limit(400);
+        if (error || !data?.length) return [];
+        return data
+          .map((row) => ({
+            ticker: canonicalId,
+            bucket: new Date(row.ts).toISOString(),
+            open: Number(row.open),
+            high: Number(row.high),
+            low: Number(row.low),
+            close: Number(row.close),
+            volume: Number(row.volume || 0),
+          }))
+          .filter(
+            (row) =>
+              Number.isFinite(row.open) &&
+              Number.isFinite(row.high) &&
+              Number.isFinite(row.low) &&
+              Number.isFinite(row.close)
+          );
+      }
+
+      const { data, error } = await supabaseAdmin
+        .from('kalshi_ohlc')
+        .select('ts, open, high, low, close, volume')
+        .eq('ticker', ticker)
+        .eq('interval', BASE_OHLC_INTERVAL)
+        .gte('ts', fromIso)
+        .lte('ts', toIso)
+        .order('ts', { ascending: true })
+        .limit(400);
+      if (error || !data?.length) return [];
+      return data
+        .map((row) => ({
+          ticker: canonicalId,
+          bucket: new Date(row.ts).toISOString(),
+          open: Number(row.open),
+          high: Number(row.high),
+          low: Number(row.low),
+          close: Number(row.close),
+          volume: Number(row.volume || 0),
+        }))
+        .filter(
+          (row) =>
+            Number.isFinite(row.open) &&
+            Number.isFinite(row.high) &&
+            Number.isFinite(row.low) &&
+            Number.isFinite(row.close)
+        );
+    } catch (err: any) {
+      console.warn(`[CandleAggregator] 1m line history: ${err?.message ?? err}`);
+      return [];
+    }
+  }
+
+  /**
    * History for a non-primary outcome. Stored series and the live forming
    * candle belong to token 0, so this reads that outcome's own CLOB token
    * and does not attach the primary forming bar.
@@ -1080,6 +1172,7 @@ class CandleAggregator {
       .from('markets')
       .select('canonical_id, platform, external_id, volume, active')
       .eq('active', true)
+      .not('canonical_id', 'ilike', '%CROSSCATEGORY%')
       .order('canonical_id', { ascending: true })
       .limit(limit);
     if (error) {
@@ -1101,6 +1194,7 @@ class CandleAggregator {
         .from('markets')
         .select('canonical_id, platform, external_id, volume, active')
         .eq('active', true)
+        .not('canonical_id', 'ilike', '%CROSSCATEGORY%')
         .order('canonical_id', { ascending: true })
         .range(range.from, range.to);
       if (error) {

@@ -277,11 +277,23 @@ async function loadStreamMarketPools(
   const selectCols =
     'canonical_id, platform, external_id, volume, active, updated_at, prices';
 
-  const rotRes = await supabaseAdmin
+  let rotQuery = supabaseAdmin
     .from('markets')
     .select(selectCols)
-    .eq('platform', platform)
-    .eq('active', true)
+    .eq('active', true);
+
+  if (platform === 'polymarket') {
+    rotQuery = rotQuery
+      .gte('canonical_id', 'polymarket_')
+      .lt('canonical_id', 'polymarket_\uffff');
+  } else if (platform === 'kalshi') {
+    rotQuery = rotQuery
+      .gte('canonical_id', 'kalshi_')
+      .lt('canonical_id', 'kalshi_\uffff')
+      .not('canonical_id', 'ilike', '%CROSSCATEGORY%');
+  }
+
+  const rotRes = await rotQuery
     .order('canonical_id', { ascending: true })
     .limit(rotateLimit);
 
@@ -440,7 +452,7 @@ async function loadActiveKalshiTickers(): Promise<string[]> {
 
   for (const market of selection.markets) {
     const ticker = String(market.external_id || '').trim();
-    if (!ticker) continue;
+    if (!ticker || ticker.includes('CROSSCATEGORY') || ticker.startsWith('KXMVE')) continue;
     tickers.push(ticker);
     tickerToCanonicalMap.set(ticker, market.canonical_id);
     const prices = market.meta?.prices;
@@ -783,6 +795,7 @@ function pushPolymarketPin(tokenIds: string[]): void {
 }
 
 function seedKalshiPin(ticker: string): void {
+  if (!ticker || ticker.includes('CROSSCATEGORY') || ticker.startsWith('KXMVE')) return;
   void kalshiGet(`/markets/${encodeURIComponent(ticker)}`)
     .then((body: any) => {
       const market = body?.market ?? body ?? {};
@@ -803,6 +816,7 @@ function seedKalshiPin(ticker: string): void {
 
 function applyResolvedPin(pin: ResolvedPin): void {
   if (pin.platform === 'kalshi' && pin.ticker) {
+    if (pin.ticker.includes('CROSSCATEGORY') || pin.ticker.startsWith('KXMVE')) return;
     tickerToCanonicalMap.set(pin.ticker, pin.canonicalId);
     if (!marketPrices.has(pin.canonicalId)) {
       marketPrices.set(pin.canonicalId, pin.prices ?? [0.5, 0.5]);

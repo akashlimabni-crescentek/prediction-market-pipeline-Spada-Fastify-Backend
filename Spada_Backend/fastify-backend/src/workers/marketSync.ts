@@ -7,8 +7,19 @@ const KALSHI_PAGE_LIMIT = 200;
 /** Safety cap per sync cycle (200 × 25 = 5,000 markets). Cursor advances across cycles. */
 const KALSHI_MAX_PAGES_PER_CYCLE = 25;
 
-/** In-process cursor so hourly sync walks the full open catalog over time. */
+/** In-process cursor so hourly sync walks the full open Kalshi catalog over time. */
 let kalshiMarketsCursor: string | null = null;
+
+/** Polymarket page size (Gamma API keyset allows up to 100) */
+const POLY_PAGE_LIMIT = 100;
+/** Safety cap per sync cycle for binary markets (100 × 20 = up to 2,000 markets per cycle). */
+const POLY_MAX_BINARY_PAGES_PER_CYCLE = 20;
+/** Safety cap per sync cycle for multi-choice events (50 × 10 = up to 500 events per cycle). */
+const POLY_MAX_EVENT_PAGES_PER_CYCLE = 10;
+
+/** In-process cursors so hourly sync walks the full open Polymarket catalog over time. */
+let polyMarketsCursor: string | null = null;
+let polyEventsCursor: string | null = null;
 
 interface StandardizedMarket {
   canonical_id: string;
@@ -76,125 +87,217 @@ function classifyCategory(title: string): string {
   return 'General';
 }
 
-// 1. Fetch Polymarket (Binary markets and multi-outcome candidate events)
-async function fetchPolymarket(): Promise<StandardizedMarket[]> {
-  const results: StandardizedMarket[] = [];
+function mapPolymarketBinaryMarket(m: any): StandardizedMarket | null {
+  const extId = String(m.conditionId || m.id || m.slug || '').trim();
+  if (!extId) return null;
 
-  // A. Fetch high-volume binary markets (Gamma keyset pagination — official + POC)
-  try {
-    const url = 'https://gamma-api.polymarket.com/markets/keyset?active=true&closed=false&limit=70&order=volume24hr&ascending=false';
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-      },
-    });
+  const outcomes = parseArrayField(m.outcomes);
+  const outcomePrices = parseArrayField(m.outcomePrices);
+  const clobTokenIds = parseArrayField(m.clobTokenIds);
+  const question = m.question || m.title || 'Untitled Market';
+  const slug = m.slug || m.event_slug || extId;
 
-    if (res.ok) {
-      const body = await res.json();
-      const markets = Array.isArray(body) ? body : (body?.markets ?? []);
-      if (Array.isArray(markets)) {
-        for (const m of markets) {
-          const extId = String(m.conditionId || m.id || m.slug || '').trim();
-          if (!extId) continue;
+  return {
+    canonical_id: `polymarket_${extId}`,
+    platform: 'polymarket',
+    external_id: extId,
+    title: question,
+    category: m.category || classifyCategory(question),
+    outcomes: outcomes.length > 0 ? outcomes.map(String) : ['YES', 'NO'],
+    prices: outcomePrices.length > 0 ? outcomePrices.map(Number) : [0.5, 0.5],
+    volume: parseFloat(m.volume24hr || m.volume || 0),
+    active: m.active ?? true,
+    raw_data: {
+      // Gamma numeric market id — keys public.polymarket_orderbook.market_id
+      id: m.id != null ? m.id : null,
+      clobTokenIds,
+      slug,
+      market_url: `https://polymarket.com/market/${slug}`,
+      description: m.description || null,
+      resolution_source: m.resolutionSource || m.resolution_source || null,
+      end_date: m.endDate || m.end_date || m.endDateIso || null,
+      conditionId: m.conditionId || null,
+    },
+    updated_at: new Date().toISOString(),
+  };
+}
 
-          const outcomes = parseArrayField(m.outcomes);
-          const outcomePrices = parseArrayField(m.outcomePrices);
-          const clobTokenIds = parseArrayField(m.clobTokenIds);
-          const question = m.question || m.title || 'Untitled Market';
-          const slug = m.slug || m.event_slug || extId;
+function mapPolymarketEvent(e: any): StandardizedMarket | null {
+  if (!Array.isArray(e.markets) || e.markets.length <= 2) return null;
 
-          results.push({
-            canonical_id: `polymarket_${extId}`,
-            platform: 'polymarket',
-            external_id: extId,
-            title: question,
-            category: m.category || classifyCategory(question),
-            outcomes: outcomes.length > 0 ? outcomes.map(String) : ['YES', 'NO'],
-            prices: outcomePrices.length > 0 ? outcomePrices.map(Number) : [0.5, 0.5],
-            volume: parseFloat(m.volume24hr || m.volume || 0),
-            active: m.active ?? true,
-            raw_data: {
-              // Gamma numeric market id — keys public.polymarket_orderbook.market_id
-              id: m.id != null ? m.id : null,
-              clobTokenIds,
-              slug,
-              market_url: `https://polymarket.com/market/${slug}`,
-              description: m.description || null,
-              resolution_source: m.resolutionSource || m.resolution_source || null,
-              end_date: m.endDate || m.end_date || m.endDateIso || null,
-              conditionId: m.conditionId || null,
-            },
-            updated_at: new Date().toISOString(),
-          });
-        }
-      }
-    }
-  } catch (err: any) {
-    console.error('[Sync Worker] Polymarket binary fetch error:', err.message);
+  const extId = String(e.id || e.slug || '').trim();
+  if (!extId) return null;
+
+  const outcomes: string[] = [];
+  const prices: number[] = [];
+  const clobTokenIds: string[] = [];
+
+  for (const subMarket of e.markets) {
+    const label = subMarket.groupItemTitle || subMarket.question || 'Option';
+    const priceArray = parseArrayField(subMarket.outcomePrices);
+    const tokenArray = parseArrayField(subMarket.clobTokenIds);
+
+    outcomes.push(label);
+    prices.push(priceArray[0] ? Number(priceArray[0]) : 0);
+    if (tokenArray[0]) clobTokenIds.push(tokenArray[0]);
   }
 
-  // B. Fetch multi-outcome events (Gamma /events/keyset — official + POC)
-  try {
-    const eventsUrl = 'https://gamma-api.polymarket.com/events/keyset?active=true&closed=false&limit=30&order=volume24hr&ascending=false';
-    const res = await fetch(eventsUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-      },
-    });
+  return {
+    canonical_id: `polymarket_event_${extId}`,
+    platform: 'polymarket',
+    external_id: extId,
+    title: e.title || 'Multi-Choice Market',
+    category: e.category || classifyCategory(e.title || ''),
+    outcomes,
+    prices,
+    volume: parseFloat(e.volume24hr || e.volume || 0),
+    active: e.active ?? true,
+    raw_data: {
+      clobTokenIds,
+      slug: e.slug || extId,
+      market_url: `https://polymarket.com/event/${e.slug || extId}`,
+      description: e.description || null,
+      end_date: e.endDate || e.end_date || null,
+    },
+    updated_at: new Date().toISOString(),
+  };
+}
 
-    if (res.ok) {
-      const body = await res.json();
-      const events = Array.isArray(body) ? body : (body?.events ?? []);
-      if (Array.isArray(events)) {
-        for (const e of events) {
-          if (!Array.isArray(e.markets) || e.markets.length <= 2) continue;
+/**
+ * Fetch Polymarket binary markets using Gamma keyset cursor pagination.
+ * Walks through pages of POLY_PAGE_LIMIT markets with safe delays between calls.
+ */
+async function fetchPolymarketBinary(): Promise<{ markets: StandardizedMarket[]; pagesFetched: number }> {
+  const list: StandardizedMarket[] = [];
+  let cursor: string | null = polyMarketsCursor;
+  let pages = 0;
 
-          const extId = String(e.id || e.slug || '').trim();
-          if (!extId) continue;
-
-          const outcomes: string[] = [];
-          const prices: number[] = [];
-          const clobTokenIds: string[] = [];
-
-          for (const subMarket of e.markets) {
-            const label = subMarket.groupItemTitle || subMarket.question || 'Option';
-            const priceArray = parseArrayField(subMarket.outcomePrices);
-            const tokenArray = parseArrayField(subMarket.clobTokenIds);
-
-            outcomes.push(label);
-            prices.push(priceArray[0] ? Number(priceArray[0]) : 0);
-            if (tokenArray[0]) clobTokenIds.push(tokenArray[0]);
-          }
-
-          results.push({
-            canonical_id: `polymarket_event_${extId}`,
-            platform: 'polymarket',
-            external_id: extId,
-            title: e.title || 'Multi-Choice Market',
-            category: e.category || classifyCategory(e.title || ''),
-            outcomes,
-            prices,
-            volume: parseFloat(e.volume24hr || e.volume || 0),
-            active: e.active ?? true,
-            raw_data: {
-              clobTokenIds,
-              slug: e.slug || extId,
-              market_url: `https://polymarket.com/event/${e.slug || extId}`,
-              description: e.description || null,
-              end_date: e.endDate || e.end_date || null,
-            },
-            updated_at: new Date().toISOString(),
-          });
-        }
+  while (pages < POLY_MAX_BINARY_PAGES_PER_CYCLE) {
+    try {
+      let url = `https://gamma-api.polymarket.com/markets/keyset?active=true&closed=false&limit=${POLY_PAGE_LIMIT}&order=volume24hr&ascending=false`;
+      if (cursor) {
+        url += `&after_cursor=${encodeURIComponent(cursor)}`;
       }
+
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+          'Accept': 'application/json',
+        },
+      });
+
+      if (!res.ok) {
+        console.warn(`[Sync Worker] Polymarket binary page ${pages + 1} response status ${res.status}`);
+        break;
+      }
+
+      const body = await res.json();
+      const rawMarkets = Array.isArray(body) ? body : (body?.markets ?? []);
+      if (!Array.isArray(rawMarkets) || rawMarkets.length === 0) {
+        cursor = null;
+        break;
+      }
+
+      for (const m of rawMarkets) {
+        const mapped = mapPolymarketBinaryMarket(m);
+        if (mapped) list.push(mapped);
+      }
+
+      pages++;
+      const nextCursor = body?.next_cursor;
+      if (!nextCursor || nextCursor === 'LTE=' || nextCursor === cursor) {
+        cursor = null;
+        break;
+      }
+      cursor = nextCursor;
+
+      await sleep(150); // Safe delay between pages to prevent rate limits
+    } catch (err: any) {
+      console.error(`[Sync Worker] Polymarket binary fetch error on page ${pages + 1}:`, err.message);
+      break;
     }
-  } catch (err: any) {
-    console.error('[Sync Worker] Polymarket multi-outcome fetch error:', err.message);
   }
 
-  return results;
+  polyMarketsCursor = cursor;
+  return { markets: list, pagesFetched: pages };
+}
+
+/**
+ * Fetch Polymarket multi-outcome events using Gamma keyset cursor pagination.
+ */
+async function fetchPolymarketEvents(): Promise<{ events: StandardizedMarket[]; pagesFetched: number }> {
+  const list: StandardizedMarket[] = [];
+  let cursor: string | null = polyEventsCursor;
+  let pages = 0;
+
+  while (pages < POLY_MAX_EVENT_PAGES_PER_CYCLE) {
+    try {
+      let url = `https://gamma-api.polymarket.com/events/keyset?active=true&closed=false&limit=50&order=volume24hr&ascending=false`;
+      if (cursor) {
+        url += `&after_cursor=${encodeURIComponent(cursor)}`;
+      }
+
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+          'Accept': 'application/json',
+        },
+      });
+
+      if (!res.ok) {
+        console.warn(`[Sync Worker] Polymarket events page ${pages + 1} response status ${res.status}`);
+        break;
+      }
+
+      const body = await res.json();
+      const rawEvents = Array.isArray(body) ? body : (body?.events ?? []);
+      if (!Array.isArray(rawEvents) || rawEvents.length === 0) {
+        cursor = null;
+        break;
+      }
+
+      for (const e of rawEvents) {
+        const mapped = mapPolymarketEvent(e);
+        if (mapped) list.push(mapped);
+      }
+
+      pages++;
+      const nextCursor = body?.next_cursor;
+      if (!nextCursor || nextCursor === 'LTE=' || nextCursor === cursor) {
+        cursor = null;
+        break;
+      }
+      cursor = nextCursor;
+
+      await sleep(150);
+    } catch (err: any) {
+      console.error(`[Sync Worker] Polymarket events fetch error on page ${pages + 1}:`, err.message);
+      break;
+    }
+  }
+
+  polyEventsCursor = cursor;
+  return { events: list, pagesFetched: pages };
+}
+
+// 1. Fetch Polymarket (Binary markets and multi-outcome candidate events via cursor pagination)
+async function fetchPolymarket(): Promise<{ markets: StandardizedMarket[]; binaryPages: number; eventPages: number }> {
+  const [binaryRes, eventRes] = await Promise.all([
+    fetchPolymarketBinary(),
+    fetchPolymarketEvents(),
+  ]);
+
+  const combined = [...binaryRes.markets, ...eventRes.events];
+  const byId = new Map<string, StandardizedMarket>();
+  for (const m of combined) {
+    byId.set(m.canonical_id, m);
+  }
+
+  return {
+    markets: [...byId.values()],
+    binaryPages: binaryRes.pagesFetched,
+    eventPages: eventRes.pagesFetched,
+  };
 }
 
 function parseKalshiMarketVolume(m: any): number {
@@ -295,7 +398,7 @@ async function attachKalshiEventVolumes(
     for (const tickerChunk of chunkArray(eventTickers, 30)) {
       const { data, error } = await supabaseAdmin
         .from('markets')
-        .select('canonical_id, volume, raw_data')
+        .select('canonical_id, volume, event_ticker:raw_data->>event_ticker')
         .eq('platform', 'kalshi')
         .eq('active', true)
         .filter('raw_data->>event_ticker', 'in', `(${tickerChunk.join(',')})`);
@@ -309,7 +412,7 @@ async function attachKalshiEventVolumes(
       }
 
       for (const row of data ?? []) {
-        const et = row.raw_data?.event_ticker;
+        const et = row.event_ticker;
         if (typeof et !== 'string' || !et) continue;
         if (batchIdsByEvent.get(et)?.has(row.canonical_id)) continue;
         const siblingVol = Number(row.volume || 0);
@@ -345,7 +448,7 @@ async function attachKalshiEventVolumes(
  * Uses mve_filter=exclude so combinatorial MVE markets don't crowd out tradable markets.
  * Advances an in-process cursor each cycle so the full catalog is covered over time.
  */
-async function fetchKalshi(): Promise<StandardizedMarket[]> {
+async function fetchKalshi(): Promise<{ markets: StandardizedMarket[]; pagesFetched: number }> {
   try {
     const { markets, nextCursor, pagesFetched } = await kalshiGetMarketsPaginated({
       status: 'open',
@@ -362,11 +465,11 @@ async function fetchKalshi(): Promise<StandardizedMarket[]> {
       );
     } else {
       console.log(
-        `[Sync Worker] Kalshi page batch pages=${pagesFetched} markets=${markets.length} cursor_pending=true`
+        `[Sync Worker] Kalshi page batch fetched (pages=${pagesFetched}, markets=${markets.length}, cursor_pending=true)`
       );
     }
 
-    if (markets.length === 0) return [];
+    if (markets.length === 0) return { markets: [], pagesFetched };
 
     // Dedupe by ticker within the batch (upsert on canonical_id also prevents DB duplicates)
     const byTicker = new Map<string, StandardizedMarket>();
@@ -377,10 +480,11 @@ async function fetchKalshi(): Promise<StandardizedMarket[]> {
     }
 
     // Attach event-level volume (sum of market volumes sharing event_ticker)
-    return attachKalshiEventVolumes([...byTicker.values()]);
+    const withVolumes = await attachKalshiEventVolumes([...byTicker.values()]);
+    return { markets: withVolumes, pagesFetched };
   } catch (err: any) {
     console.warn('[Sync Worker] Kalshi authenticated request failed:', err.message);
-    return [];
+    return { markets: [], pagesFetched: 0 };
   }
 }
 
@@ -432,8 +536,8 @@ async function upsertMarketsBatch(rows: StandardizedMarket[], attempt = 1): Prom
 }
 
 // 3. Upsert into Supabase (Preserves existing AI summaries)
-async function saveMarkets(markets: StandardizedMarket[]) {
-  if (markets.length === 0) return;
+async function saveMarkets(markets: StandardizedMarket[]): Promise<number> {
+  if (markets.length === 0) return 0;
 
   const existingMap = new Map<
     string,
@@ -480,19 +584,64 @@ async function saveMarkets(markets: StandardizedMarket[]) {
     await sleep(100);
   }
 
-  console.log(`[Sync Worker] Successfully synced ${written}/${markets.length} markets into Supabase.`);
+  return written;
 }
 
-export async function runMarketSync() {
-  console.log('[Sync Worker] Starting market data ingestion...');
+let isSyncRunning = false;
 
-  const [polyMarkets, kalshiMarkets] = await Promise.all([
-    fetchPolymarket(),
-    fetchKalshi(),
-  ]);
+export async function runMarketSync(): Promise<void> {
+  if (isSyncRunning) {
+    console.warn('[Sync Worker] A market sync cycle is already in progress. Skipping duplicate execution.');
+    return;
+  }
+  isSyncRunning = true;
 
-  const allMarkets = [...polyMarkets, ...kalshiMarkets];
-  await saveMarkets(allMarkets);
+  const startTime = Date.now();
+  const startTimeIso = new Date().toISOString();
+  console.log(`\n================================================================================`);
+  console.log(`[Sync Worker] [${startTimeIso}] Starting hourly market sync worker...`);
+  console.log(`================================================================================`);
+
+  try {
+    const [polyRes, kalshiRes] = await Promise.all([
+      fetchPolymarket(),
+      fetchKalshi(),
+    ]);
+
+    const polyMarkets = polyRes.markets;
+    const kalshiMarkets = kalshiRes.markets;
+    const allMarkets = [...polyMarkets, ...kalshiMarkets];
+
+    console.log(
+      `[Sync Worker] Polymarket fetched: ${polyMarkets.length} markets ` +
+      `(Binary pages: ${polyRes.binaryPages}, Event pages: ${polyRes.eventPages}, ` +
+      `Cursor: ${polyMarketsCursor ? 'pending next cycle' : 'pass complete'})`
+    );
+    console.log(
+      `[Sync Worker] Kalshi fetched: ${kalshiMarkets.length} markets ` +
+      `(Pages: ${kalshiRes.pagesFetched}, Cursor: ${kalshiMarketsCursor ? 'pending next cycle' : 'pass complete'})`
+    );
+    console.log(`[Sync Worker] Total markets collected this cycle: ${allMarkets.length}. Saving to Supabase...`);
+
+    const written = await saveMarkets(allMarkets);
+
+    const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
+    const nextRun = new Date(Date.now() + 60 * 60 * 1000);
+    const nextRunTimeStr = nextRun.toLocaleTimeString('en-US', { hour12: true });
+
+    console.log(`================================================================================`);
+    console.log(`[Sync Worker] [${new Date().toISOString()}] Hourly sync completed successfully in ${durationSec}s:`);
+    console.log(`  ✓ Total markets processed: ${allMarkets.length}`);
+    console.log(`  ✓ Polymarket markets: ${polyMarkets.length}`);
+    console.log(`  ✓ Kalshi markets: ${kalshiMarkets.length}`);
+    console.log(`  ✓ Stored into Supabase: ${written}/${allMarkets.length}`);
+    console.log(`  ✓ Next scheduled run: in 1 hour (around ${nextRunTimeStr})`);
+    console.log(`================================================================================\n`);
+  } catch (err: any) {
+    console.error(`[Sync Worker] Fatal error in market sync worker:`, err?.message ?? err);
+  } finally {
+    isSyncRunning = false;
+  }
 }
 
 if (process.argv[1]?.endsWith('marketSync.ts')) {
